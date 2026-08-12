@@ -1657,7 +1657,16 @@ class BasePlatformAdapter(ABC):
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
-        # Non-network / post-retry formatting failure: try plain text as fallback
+        # Non-network / post-retry formatting failure: try plain text as fallback.
+        # EXCEPT http_callback delivery — re-POSTing won't fix a server error,
+        # and the "(Response formatting failed, plain text:)" prefix leaks to
+        # the end user.  Log and return the original failure.
+        if hasattr(self, '_delivery_info'):
+            delivery = self._delivery_info.get(chat_id, {})
+            if delivery.get('deliver') == 'http_callback':
+                logger.error("[%s] http_callback send failed, not falling back: %s", self.name, error_str)
+                return result
+
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
             chat_id=chat_id,

@@ -400,6 +400,16 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
 
     api_key = os.getenv("MINIMAX_API_KEY", "")
     if not api_key:
+        # Fallback: read directly from ~/.hermes/.env (for hot-reload without gateway restart)
+        from pathlib import Path as _P
+        _env_path = _P(os.getenv("HERMES_HOME", str(_P.home() / ".hermes"))) / ".env"
+        if _env_path.exists():
+            for _line in _env_path.read_text(encoding="utf-8", errors="replace").split("\n"):
+                if _line.startswith("MINIMAX_API_KEY=") and not _line.startswith("#"):
+                    api_key = _line.split("=", 1)[1].strip()
+                    os.environ["MINIMAX_API_KEY"] = api_key  # cache for subsequent calls
+                    break
+    if not api_key:
         raise ValueError("MINIMAX_API_KEY not set. Get one at https://platform.minimax.io/")
 
     mm_config = tts_config.get("minimax", {})
@@ -926,6 +936,24 @@ def text_to_speech_tool(
 
         file_size = os.path.getsize(file_str)
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
+
+        # ── v4.2.19-phase4b: Isles-story spoken_text sidecar ──
+        # Gate: platform==webhook AND session key contains ":isles-story:"
+        # (tight match — equivalent to is_isles_story_source route check)
+        if platform == "webhook":
+            _sess_key = get_session_env("HERMES_SESSION_KEY", "")
+            if ":isles-story:" in _sess_key:
+                _spoken_path = file_str + ".spoken.txt"
+                try:
+                    _fd = os.open(_spoken_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(_fd, "w", encoding="utf-8") as _sf:
+                        _sf.write(text)
+                except Exception as _se:
+                    logger.warning(
+                        "[tts] companion file write failed: %s",
+                        type(_se).__name__
+                    )
+        # ── end sidecar ──
 
         # Build response with MEDIA tag for platform delivery
         media_tag = f"MEDIA:{file_str}"

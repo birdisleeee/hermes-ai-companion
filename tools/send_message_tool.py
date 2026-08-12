@@ -126,6 +126,14 @@ SEND_MESSAGE_SCHEMA = {
             "message": {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
+            },
+            "media": {
+                "type": "string",
+                "description": "Optional local file path to send as a media attachment. When combined with asVoice=true, this path takes priority over TTS (the file is sent directly)."
+            },
+            "asVoice": {
+                "type": "boolean",
+                "description": "When true, converts the message text to speech (TTS) and sends it as a voice message. Only supported on platforms that have voice capability (qqbot)."
             }
         },
         "required": []
@@ -285,6 +293,8 @@ def _handle_send(args):
                 cleaned_message,
                 thread_id=thread_id,
                 media_files=media_files,
+                asVoice=args.get("asVoice", False),
+                media_path=args.get("media"),
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -412,7 +422,7 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, asVoice=False, media_path=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -539,6 +549,23 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- QQ Bot: asVoice → TTS → send_voice ---
+    if platform == Platform.QQBOT and asVoice:
+        if media_path:
+            voice_file = media_path
+        else:
+            try:
+                voice_file = await _tts_to_file(message)
+            except Exception as e:
+                return {"error": f"QQBot TTS failed: {e}"}
+        if not os.path.isfile(str(voice_file)):
+            return {"error": f"QQBot voice file not found: {voice_file}"}
+        return await _send_qqbot_media(pconfig, chat_id, message, [(str(voice_file), True)])
+
+    # --- QQ Bot: native voice/image/file via REST API media upload ---
+    if platform == Platform.QQBOT and media_files:
+        return await _send_qqbot_media(pconfig, chat_id, message, media_files)
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
@@ -582,6 +609,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
+        elif platform == Platform.WEBHOOK:
+            result = await _send_webhook_callback(pconfig, chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -1519,6 +1548,210 @@ async def _send_qqbot(pconfig, chat_id, message):
                 return _error(f"QQBot send failed: {resp.status_code} {resp.text}")
     except Exception as e:
         return _error(f"QQBot send failed: {e}")
+
+
+async def _send_webhook_callback(pconfig, chat_id, message):
+    """Send a message via webhook http_callback (standalone path for cron delivery).
+
+    Parses the route name from chat_id, looks up the route config in
+    pconfig.extra.routes, and POSTs to the callback URL.
+    """
+    def _error(msg):
+        return {"error": msg}
+
+    routes = (pconfig.extra or {}).get("routes", {})
+    if not routes:
+        return _error("Webhook platform has no routes configured")
+
+    # Parse route name from chat_id
+    route_name = None
+    if chat_id.startswith("webhook:"):
+        parts = chat_id.split(":", 2)
+        route_name = parts[1] if len(parts) >= 2 else None
+    else:
+        route_name = chat_id
+
+    if not route_name or route_name not in routes:
+        return _error(f"Webhook route '{route_name}' not found in configured routes")
+
+    route_cfg = routes[route_name]
+    deliver_type = route_cfg.get("deliver", "log")
+    if deliver_type != "http_callback":
+        return _error(f"Webhook route '{route_name}' deliver type is '{deliver_type}', not 'http_callback'")
+
+    deliver_extra = route_cfg.get("deliver_extra", {})
+    url = deliver_extra.get("url", "")
+    token = deliver_extra.get("token", "")
+    if not url:
+        return _error(f"Webhook route '{route_name}' has no callback URL")
+
+    payload = {"content": message, "author": "bird"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "hermes-webhook/1.0",
+    }
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    logger.info("[webhook] standalone callback OK route=%s", route_name)
+                    return {"success": True, "platform": "webhook", "chat_id": chat_id}
+                body = await resp.text()
+                return _error(f"Webhook callback failed: HTTP {resp.status} {body[:200]}")
+    except Exception as e:
+        return _error(f"Webhook callback failed: {e}")
+
+
+async def _send_qqbot_media(pconfig, chat_id, message, media_files):
+    """Send voice/image via QQ Bot REST API media upload + send.
+
+    Uses the QQ media upload API (api.sgroup.qq.com) to upload the file,
+    then sends it as a native media message.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return _error("QQBot media send requires httpx. Run: pip install httpx")
+
+    extra = pconfig.extra or {}
+    appid = extra.get("app_id") or os.getenv("QQ_APP_ID", "")
+    secret = (pconfig.token or extra.get("client_secret")
+              or os.getenv("QQ_CLIENT_SECRET", ""))
+    if not appid or not secret:
+        return _error("QQBot: QQ_APP_ID / QQ_CLIENT_SECRET not configured.")
+
+    # Determine chat type from chat_id format
+    chat_type = "c2c" if len(chat_id) == 32 else "group"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: Get access token
+            token_resp = await client.post(
+                "https://bots.qq.com/app/getAppAccessToken",
+                json={"appId": str(appid), "clientSecret": str(secret)},
+            )
+            if token_resp.status_code != 200:
+                return _error(f"QQBot token request failed: {token_resp.status_code}")
+            token_data = token_resp.json()
+            access_token = token_data.get("access_token")
+            if not access_token:
+                return _error("QQBot: no access_token in response")
+
+            headers = {"Authorization": f"QQBot {access_token}"}
+
+            last_result = None
+            for media_path, is_voice in media_files:
+                if not os.path.isfile(media_path):
+                    return _error(f"QQBot media: file not found: {media_path}")
+
+                # Step 2: Transcode ogg/opus to wav if needed
+                import subprocess as _sp
+                ext = os.path.splitext(media_path)[1].lower()
+                transcode_path = None
+                if is_voice and ext in ('.ogg', '.opus'):
+                    transcode_path = media_path + '_sendtmp.wav'
+                    _sp.run(
+                        ["ffmpeg", "-y", "-i", media_path,
+                         "-ar", "24000", "-ac", "1",
+                         "-sample_fmt", "s16",
+                         transcode_path],
+                        capture_output=True, timeout=30,
+                    )
+                    if os.path.isfile(transcode_path):
+                        media_path = transcode_path
+
+                # Step 3: Upload media
+                file_type = 3  # MEDIA_TYPE_VOICE
+                if not is_voice:
+                    ext = os.path.splitext(media_path)[1].lower()
+                    file_type = 1 if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp") else 4
+
+                upload_path = f"/v2/users/{chat_id}/files" if chat_type == "c2c" else f"/v2/groups/{chat_id}/files"
+
+                with open(media_path, "rb") as f:
+                    file_data = f.read()
+                import base64
+                b64_data = base64.b64encode(file_data).decode()
+
+                upload_body = {
+                    "file_type": file_type,
+                    "file_data": b64_data,
+                    "srv_send_msg": False,
+                }
+
+                upload_resp = await client.post(
+                    f"https://api.sgroup.qq.com{upload_path}",
+                    json=upload_body,
+                    headers=headers,
+                    timeout=30,
+                )
+                if upload_resp.status_code not in (200, 201):
+                    return _error(f"QQBot media upload failed: {upload_resp.status_code} {upload_resp.text}")
+
+                upload_data = upload_resp.json()
+                file_info = upload_data.get("file_info")
+                if not file_info:
+                    return _error(f"QQBot: upload returned no file_info: {upload_data}")
+
+                # Step 3: Send media message
+                msg_type = 7  # MSG_TYPE_MEDIA
+                import random
+                msg_seq = random.randint(10000, 99999)
+
+                send_path = f"/v2/users/{chat_id}/messages" if chat_type == "c2c" else f"/channels/{chat_id}/messages"
+                send_body = {
+                    "msg_type": msg_type,
+                    "media": {"file_info": file_info},
+                    "msg_seq": msg_seq,
+                    "content": message[:2000] if message and message.strip() else "",
+                }
+
+                # Extract caption text from the original message
+                if message and message.strip():
+                    send_body["content"] = message.strip()[:2000]
+
+                send_resp = await client.post(
+                    f"https://api.sgroup.qq.com{send_path}",
+                    json=send_body,
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+                if send_resp.status_code in (200, 201):
+                    data = send_resp.json()
+                    last_result = {"success": True, "platform": "qqbot", "chat_id": chat_id,
+                                   "message_id": data.get("id")}
+                else:
+                    return _error(f"QQBot media send failed: {send_resp.status_code} {send_resp.text}")
+
+                # Cleanup temp wav
+                if transcode_path and os.path.isfile(transcode_path):
+                    try:
+                        os.unlink(transcode_path)
+                    except OSError:
+                        pass
+
+            return last_result or {"success": True, "platform": "qqbot", "chat_id": chat_id}
+
+    except Exception as e:
+        return _error(f"QQBot media send failed: {e}")
+
+
+async def _tts_to_file(text: str) -> str:
+    """Call edge-tts to generate a voice file, return path to ogg."""
+    import tempfile
+    try:
+        import edge_tts
+    except ImportError:
+        raise RuntimeError("edge_tts not installed. Run: pip install edge-tts")
+    communicate = edge_tts.Communicate(text, voice="zh-CN-XiaoxiaoNeural")
+    tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    tmp.close()
+    await communicate.save(tmp.name)
+    return tmp.name
 
 
 async def _send_yuanbao(chat_id, message, media_files=None):

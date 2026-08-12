@@ -118,15 +118,23 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MARKDOWN_HINT_RE = re.compile(
-    r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)",
+    r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)|(@<at id=cli_[a-zA-Z0-9]+></at>)",
     re.MULTILINE,
 )
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
+_AT_MENTION_RE = re.compile(r"@<at id=(cli_[a-zA-Z0-9]+)></at>")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+# Mapping from Feishu Bot app_id (cli_xxx) → open_id (ou_xxx)
+# The post content at tag requires open_id, not app_id
+# https://open.feishu.cn/document/server-docs/im-v1/message-content-description/post#45e4b290
+_APP_ID_TO_OPEN_ID: Dict[str, str] = {
+    "cli_aa8b9b33f639dbb7": "ou_8c38e900e854dc236b2e610a9af1930e",  # 桔小鸟/小宝 (新)
+    # Add more bots here as needed
+}
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -467,6 +475,18 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     if not content:
         return [[{"tag": "md", "text": ""}]]
     if "```" not in content:
+        # Handle @<at id=cli_xxx></at> mentions in non-code content
+        if _AT_MENTION_RE.search(content):
+            elements: List[Dict[str, str]] = []
+            parts = _AT_MENTION_RE.split(content)
+            for i, part in enumerate(parts):
+                if i % 2 == 0:
+                    if part:
+                        elements.append({"tag": "md", "text": part})
+                else:
+                    open_id = _APP_ID_TO_OPEN_ID.get(part, part)
+                    elements.append({"tag": "at", "user_id": open_id})
+            return [elements] if elements else [[{"tag": "md", "text": content}]]
         return [[{"tag": "md", "text": content}]]
 
     rows: List[List[Dict[str, str]]] = []

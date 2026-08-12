@@ -112,7 +112,7 @@ from gateway.platforms.qqbot.constants import (
     MSG_TYPE_INPUT_NOTIFY,
     MEDIA_TYPE_IMAGE,
     MEDIA_TYPE_VIDEO,
-    MEDIA_TYPE_VOICE,
+    MEDIA_TYPE_FILE,
     MEDIA_TYPE_FILE,
 )
 from gateway.platforms.qqbot.utils import (
@@ -1893,16 +1893,31 @@ class QQAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True)
 
+        content = self.strip_cron_wrapper(content)
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+
+        # Split by ||| delimiter for multi-bubble output.
+        # Each segment between ||| is sent as a separate message bubble.
+        # Segments are still subject to MAX_MESSAGE_LENGTH truncation.
+        SPLIT_DELIMITER = "|||"
+        if SPLIT_DELIMITER in formatted:
+            segments = [
+                s.strip() for s in formatted.split(SPLIT_DELIMITER) if s.strip()
+            ]
+        else:
+            segments = [formatted]
 
         last_result = SendResult(success=False, error="No chunks")
-        for chunk in chunks:
-            last_result = await self._send_chunk(chat_id, chunk, reply_to)
-            if not last_result.success:
-                return last_result
-            # Only reply_to the first chunk
-            reply_to = None
+        for segment in segments:
+            segment_chunks = self.truncate_message(segment, self.MAX_MESSAGE_LENGTH)
+            for chunk in segment_chunks:
+                last_result = await self._send_chunk(chat_id, chunk, reply_to)
+                if not last_result.success:
+                    return last_result
+                reply_to = None
+            # Small delay between segments for natural pacing
+            if len(segments) > 1:
+                await asyncio.sleep(0.3)
         return last_result
 
     async def _send_chunk(
@@ -2073,11 +2088,166 @@ class QQAdapter(BasePlatformAdapter):
             reply_to: Optional[str] = None,
             **kwargs,
     ) -> SendResult:
-        """Send a voice message natively."""
-        del kwargs
-        return await self._send_media(
-            chat_id, audio_path, MEDIA_TYPE_VOICE, "voice", caption, reply_to
-        )
+        """Send a voice message natively.
+
+        QQ Bot API (v2) file_type=3 voice does NOT support ogg/opus directly.
+        We transcode ogg/opus to mp3 via ffmpeg before uploading.
+
+        test_mode in metadata:
+          None / '' → normal path (transcode + _send_media)
+          'A'       → passive reply: send with msg_id + msg_seq
+          'B'       → srv_send_msg=true on upload, skip _send_media
+          'C'       → url upload instead of file_data
+        """
+        metadata = kwargs.get("metadata") or {}
+        test_mode = metadata.get("test_mode", "") if isinstance(metadata, dict) else ""
+
+        logger.info("[%s] send_voice called: audio_path=%s test_mode=%s",
+                    self._log_tag, audio_path, test_mode or "normal")
+
+        # ---- step 1: ensure we have a non-ogg/opus file ----
+        ext = Path(audio_path).suffix.lower()
+        AUDIO_EXTS_NEED_TRANSCODE = {'.ogg', '.opus'}
+        need_transcode = ext in AUDIO_EXTS_NEED_TRANSCODE
+        transcode_path: Optional[str] = None
+
+        try:
+            if need_transcode:
+                transcode_dir = Path(audio_path).parent
+                transcode_path = str(
+                    transcode_dir / f"voice_transcoded_{uuid.uuid4().hex[:8]}.mp3"
+                )
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", audio_path,
+                    "-ar", "24000",
+                    "-ac", "1",
+                    "-codec:a", "libmp3lame",
+                    "-b:a", "64k",
+                    transcode_path,
+                ]
+                logger.info(
+                    "[%s] Transcoding voice: %s -> %s",
+                    self._log_tag, audio_path, transcode_path,
+                )
+                proc = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+
+                if proc.returncode != 0:
+                    err_text = stderr.decode("utf-8", errors="replace")[:500]
+                    logger.error(
+                        "[%s] ffmpeg transcode failed (code=%d): %s",
+                        self._log_tag, proc.returncode, err_text,
+                    )
+                    Path(transcode_path).unlink(missing_ok=True)
+                    transcode_path = None
+                    return SendResult(success=False, error=f"ffmpeg failed: {err_text}")
+                else:
+                    logger.info(
+                        "[%s] Transcode done: %s", self._log_tag, transcode_path
+                    )
+                    await self._log_ffprobe(transcode_path, "transcoded voice")
+                    audio_path = transcode_path
+            else:
+                await self._log_ffprobe(audio_path, "voice (no transcode)")
+
+            # ---- step 2: upload + send ----
+            if test_mode == "B":
+                # Test B: srv_send_msg=true, skip _send_media
+                logger.info("[%s] TEST B: srv_send_msg=true upload", self._log_tag)
+                raw = Path(audio_path).read_bytes()
+                b64 = base64.b64encode(raw).decode("ascii")
+                upload = await self._upload_media(
+                    self._guess_chat_type(chat_id),
+                    chat_id,
+                    MEDIA_TYPE_FILE,
+                    file_data=b64,
+                    srv_send_msg=True,
+                )
+                logger.info("[%s] TEST B upload response: %s", self._log_tag, json.dumps(upload))
+                if upload.get("file_info"):
+                    return SendResult(success=True, message_id="srv_send_true")
+                return SendResult(success=False, error=f"No file_info: {upload}")
+
+            # ---- normal / test A / test C: load file ----
+            data, content_type, resolved_name = await self._load_media(audio_path, None)
+            chat_type = self._guess_chat_type(chat_id)
+
+            if test_mode == "C":
+                # Test C: url upload
+                logger.info("[%s] TEST C: url upload", self._log_tag)
+                upload = await self._upload_media(
+                    chat_type, chat_id, MEDIA_TYPE_FILE,
+                    url=data if self._is_url(audio_path) else None,
+                    file_data=data if not self._is_url(audio_path) else None,
+                    srv_send_msg=False,
+                )
+                logger.info("[%s] TEST C upload response: %s", self._log_tag, json.dumps(upload))
+            else:
+                # Normal / Test A: file_data upload
+                upload = await self._upload_media(
+                    chat_type, chat_id, MEDIA_TYPE_FILE,
+                    file_data=data if not self._is_url(audio_path) else None,
+                    url=data if self._is_url(audio_path) else None,
+                    srv_send_msg=False,
+                )
+                if test_mode != "A":
+                    logger.info("[%s] Normal upload response: %s", self._log_tag, json.dumps(upload))
+
+            file_info = upload.get("file_info")
+            if not file_info:
+                logger.error("[%s] Upload returned no file_info: %s", self._log_tag, upload)
+                return SendResult(success=False, error=f"No file_info: {upload}")
+
+            # ---- send media message ----
+            msg_seq = self._next_msg_seq(chat_id)
+            body: Dict[str, Any] = {
+                "msg_type": MSG_TYPE_MEDIA,
+                "media": {"file_info": file_info},
+                "msg_seq": msg_seq,
+            }
+            if caption:
+                body["content"] = caption[: self.MAX_MESSAGE_LENGTH]
+
+            # Test A: add msg_id (passive reply)
+            if test_mode == "A" and reply_to:
+                body["msg_id"] = reply_to
+                logger.info("[%s] TEST A: passive reply with msg_id=%s msg_seq=%s",
+                            self._log_tag, reply_to, msg_seq)
+
+            if reply_to and test_mode != "A":
+                body["msg_id"] = reply_to
+
+            target_path = (
+                f"/v2/users/{chat_id}/messages"
+                if chat_type == "c2c"
+                else f"/v2/groups/{chat_id}/messages"
+            )
+
+            logger.info("[%s] Sending media msg: chat=%s type=%s body=%s",
+                        self._log_tag, chat_id, chat_type, json.dumps(body))
+
+            send_data = await self._api_request("POST", target_path, body)
+            logger.info("[%s] Send media response: %s", self._log_tag, json.dumps(send_data))
+
+            # Cleanup temp file after send
+            if transcode_path and Path(transcode_path).exists():
+                Path(transcode_path).unlink(missing_ok=True)
+                logger.info("[%s] Cleaned up temp voice: %s", self._log_tag, transcode_path)
+
+            return SendResult(
+                success=True,
+                message_id=str(send_data.get("id", uuid.uuid4().hex[:12])),
+                raw_response=send_data,
+            )
+        except Exception:
+            if transcode_path and Path(transcode_path).exists():
+                Path(transcode_path).unlink(missing_ok=True)
+            raise
 
     async def send_video(
             self,
@@ -2160,6 +2330,10 @@ class QQAdapter(BasePlatformAdapter):
                 srv_send_msg=False,
                 file_name=resolved_name if file_type == MEDIA_TYPE_FILE else None,
             )
+            logger.info(
+                "[%s] _upload_media response: %s",
+                self._log_tag, json.dumps(upload, ensure_ascii=False)[:300],
+            )
 
             file_info = upload.get("file_info")
             if not file_info:
@@ -2179,6 +2353,11 @@ class QQAdapter(BasePlatformAdapter):
             if reply_to:
                 body["msg_id"] = reply_to
 
+            logger.info(
+                "[%s] Sending media msg: chat_id=%s chat_type=%s body=%s",
+                self._log_tag, chat_id, chat_type,
+                json.dumps(body, ensure_ascii=False)[:400],
+            )
             send_data = await self._api_request(
                 "POST",
                 (
@@ -2187,6 +2366,10 @@ class QQAdapter(BasePlatformAdapter):
                     else f"/v2/groups/{chat_id}/messages"
                 ),
                 body,
+            )
+            logger.info(
+                "[%s] Media msg send response: %s",
+                self._log_tag, json.dumps(send_data, ensure_ascii=False)[:300],
             )
             return SendResult(
                 success=True,
@@ -2380,3 +2563,41 @@ class QQAdapter(BasePlatformAdapter):
             return True
         self._seen_messages[msg_id] = now
         return False
+
+    @staticmethod
+    def strip_cron_wrapper(content: str) -> str:
+        """Strip scheduler cron header/footer wrapper for cleaner QQ output."""
+        if not content.startswith("Cronjob Response: "):
+            return content
+
+        divider = "\n-------------\n\n"
+        footer_prefix = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
+        divider_pos = content.find(divider)
+        footer_pos = content.rfind(footer_prefix)
+        if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos:
+            return content
+
+        header = content[:divider_pos]
+        if "\n(job_id: " not in header:
+            return content
+
+        body_start = divider_pos + len(divider)
+        body = content[body_start:footer_pos].strip()
+        return body or content
+
+    @staticmethod
+    async def _log_ffprobe(file_path: str, label: str = "audio") -> None:
+        """Run ffprobe on a file and log the output."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-hide_banner", file_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            info = (stdout + stderr).decode("utf-8", errors="replace")[:500]
+            for line in info.strip().split("\n"):
+                if line.strip():
+                    logger.info("[FFPROBE: %s] %s", label, line.strip())
+        except Exception as exc:
+            logger.debug("[FFPROBE: %s] Failed: %s", label, exc)

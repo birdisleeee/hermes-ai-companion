@@ -82,6 +82,26 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+# Alternative silent markers that some LLMs produce (Chinese variants,
+# full-width brackets).  All are treated as equivalent to [SILENT].
+_SILENT_MARKERS = frozenset({
+    SILENT_MARKER,
+    "[静默]",
+    "［静默］",
+    "[SILENT]",
+    "［SILENT］",
+})
+
+
+def _is_silent_response(text: str) -> bool:
+    """Check if the cron response is a silent marker (any variant)."""
+    if not text:
+        return False
+    stripped = text.strip().upper()
+    for marker in _SILENT_MARKERS:
+        if marker in stripped:
+            return True
+    return False
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = get_hermes_home()
@@ -303,6 +323,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         "bluebubbles": Platform.BLUEBUBBLES,
         "qqbot": Platform.QQBOT,
         "yuanbao": Platform.YUANBAO,
+        "webhook": Platform.WEBHOOK,
     }
 
     # Optionally wrap the content with a header/footer so the user knows this
@@ -444,6 +465,104 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
+
+
+def _inject_cron_response_into_session(
+    job: dict,
+    content: str,
+    targets: list,
+) -> None:
+    """Inject the cron response as an assistant message into target session transcripts.
+
+    After delivering a cron response to a platform (webhook, feishu, qqbot, etc.),
+    also append it to the matching session's transcript (SQLite + JSONL) so the
+    agent has conversation context on the next user message from that platform.
+
+    Without this, cron responses are "fire-and-forget": the user sees them in
+    chat, but the agent has no memory of what it said, leading to disconnected
+    follow-up conversations.
+
+    Best-effort: logs failures at debug level but never raises.
+    """
+    if not targets or not content:
+        return
+
+    import time
+
+    # Resolve sessions.json path
+    try:
+        sessions_file = get_hermes_home() / "sessions" / "sessions.json"
+        if not sessions_file.exists():
+            return
+        with open(sessions_file, "r", encoding="utf-8") as f:
+            sessions_data = json.load(f)
+    except Exception as e:
+        logger.debug("Cron inject: failed to load sessions.json: %s", e)
+        return
+
+    # Try to use SessionDB for SQLite writes
+    session_db = None
+    try:
+        from hermes_state import SessionDB
+        session_db = SessionDB()
+    except Exception:
+        pass
+
+    timestamp = time.time()
+
+    for target in targets:
+        platform_name = target["platform"]
+        chat_id = str(target["chat_id"])
+
+        # Find the session_id by matching platform + chat_id in session keys.
+        # Session keys look like: agent:main:{platform}:{chat_type}:{chat_id}:{user_id}
+        # The chat_id is always a substring of the key.
+        # Pick the most recently updated match.
+        best_session_id = None
+        best_updated_at = ""
+        for key, entry in sessions_data.items():
+            if chat_id in key and platform_name in key:
+                updated = entry.get("updated_at", "")
+                if updated > best_updated_at:
+                    best_updated_at = updated
+                    best_session_id = entry.get("session_id")
+
+        if not best_session_id:
+            logger.debug(
+                "Cron inject: no session found for %s:%s",
+                platform_name, chat_id,
+            )
+            continue
+
+        # Build the assistant message in the format expected by load_transcript
+        message = {
+            "role": "assistant",
+            "content": content,
+            "timestamp": timestamp,
+        }
+
+        # Write to SQLite
+        if session_db:
+            try:
+                session_db.append_message(
+                    session_id=best_session_id,
+                    role="assistant",
+                    content=content,
+                )
+            except Exception as e:
+                logger.debug("Cron inject: SQLite write failed for %s: %s", best_session_id, e)
+
+        # Write to JSONL transcript
+        try:
+            transcript_path = get_hermes_home() / "sessions" / f"{best_session_id}.jsonl"
+            with open(transcript_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(message, ensure_ascii=False) + "\n")
+            logger.info(
+                "Cron inject: appended response to session %s (%s:%s)",
+                best_session_id, platform_name, chat_id,
+            )
+        except Exception as e:
+            logger.debug("Cron inject: JSONL write failed for %s: %s", best_session_id, e)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
@@ -1117,8 +1236,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # output is already saved above).  Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                if should_deliver and success and _is_silent_response(deliver_content):
+                    logger.info("Job '%s': agent returned silent marker - skipping delivery", job["id"])
                     should_deliver = False
 
                 delivery_error = None
@@ -1128,6 +1247,15 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+                    # Inject the response into the target session's transcript
+                    # so the agent has context on the next user message.
+                    # Uses the same delivery targets resolved by _deliver_result.
+                    try:
+                        inject_targets = _resolve_delivery_targets(job)
+                        _inject_cron_response_into_session(job, deliver_content, inject_targets)
+                    except Exception as ie:
+                        logger.debug("Cron inject failed for job %s: %s", job["id"], ie)
 
                 # Treat empty final_response as a soft failure so last_status
                 # is not "ok" — the agent ran but produced nothing useful.

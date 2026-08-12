@@ -35,14 +35,42 @@ import re
 import subprocess
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 try:
     from aiohttp import web
+    import aiohttp
 
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
+
+# Phase 4b.7d — module-level forbidden keywords (defense-in-depth)
+# Used by _deliver_http_callback() schema guard to prevent LLM leakage
+# into frontend-visible visible_reasoning summaries.
+FORBIDDEN_SUBSTRINGS = [
+    "系统", "用户", "对方", "推理", "分析",
+    "思考链", "chain-of-thought", "reasoning",
+    "system prompt", "tool call", "token",
+    "API", "webhook", "callback", "prompt",
+    "json", "schema", "confidence",
+]
+
+# Wide preview: dedicated forbidden list for visible_inner_note.text
+# Less aggressive than FORBIDDEN_SUBSTRINGS — does NOT filter 用户/分析
+# which are normal in reasoning content under wide preview strategy.
+VISIBLE_INNER_NOTE_FORBIDDEN = [
+    "system prompt", "tool call", "token", "secret",
+    "API", "webhook", "callback",
+    "JSON", "schema",
+    "config", "model config",
+    "reasoning_content", "raw reasoning", "chain-of-thought",
+    "http://", "https://",
+    "def ", "class ", "import ",
+    "```",
+]
+
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -90,6 +118,24 @@ class WebhookAdapter(BasePlatformAdapter):
         # back to the "log" deliver type.
         self._delivery_info: Dict[str, dict] = {}
         self._delivery_info_created: Dict[str, float] = {}
+
+        # ── v4.2.19: voice message bridge ──
+        # Written by run.py _isles_voice_bridge_sync(), read+consumed by send().
+        # dict {voice, transcript} or None.  Future: message_units[] list.
+        self._pending_voice_meta: Optional[dict] = None
+
+        # Phase 4b.7d — per-message visible_reasoning cache
+        # Written by run.py (future Phase 4a+4b activation), read by send(),
+        # delete-on-read, 30s TTL.  Currently no-op: cache always empty
+        # until Phase 4a generator is deployed.
+        self._vr_meta_cache: Dict[str, dict] = {}
+        self._vr_meta_cache_ts: Dict[str, float] = {}
+
+        # 4d.3: per-message inner_note cache (concurrency-safe, separate from VR cache)
+        self._inner_note_cache: Dict[str, dict] = {}
+        self._inner_note_cache_ts: Dict[str, float] = {}
+
+
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -192,8 +238,82 @@ class WebhookAdapter(BasePlatformAdapter):
         do not consume the entry and silently downgrade the final response
         to the ``log`` deliver type.  TTL cleanup happens on POST.
         """
-        delivery = self._delivery_info.get(chat_id, {})
+        # Phase 4b.7d — opportunistic cleanup of stale VR cache (no bg task)
+        _now_vr = time.time()
+        _stale_keys = [
+            k for k, ts in self._vr_meta_cache_ts.items()
+            if _now_vr - ts > 30
+        ]
+        for k in _stale_keys:
+            self._vr_meta_cache.pop(k, None)
+            self._vr_meta_cache_ts.pop(k, None)
+
+        # 4d.3: opportunistic TTL cleanup for inner_note cache
+        _nn_stale_keys = [
+            k for k, ts in self._inner_note_cache_ts.items()
+            if _now_vr - ts > 60
+        ]
+        for k in _nn_stale_keys:
+            self._inner_note_cache.pop(k, None)
+            self._inner_note_cache_ts.pop(k, None)
+
+        # Phase 4b.7d — per-reply VR meta lookup (delete-on-read, cache-only path)
+        # Currently always None (cache empty — no generator to populate it).
+        _vr_meta = None
+        try:
+            import hashlib as _h
+            _vr_content_hash = _h.sha256(content.encode()).hexdigest()[:16]
+            _vr_reply_to = reply_to or 'no-reply'
+            _vr_cache_key = f"{chat_id}:{_vr_reply_to}:{_vr_content_hash}"
+            _vr_meta = self._vr_meta_cache.pop(_vr_cache_key, None)
+            if _vr_meta is not None:
+                self._vr_meta_cache_ts.pop(_vr_cache_key, None)
+        except Exception:
+            pass
+
+        # 4d.3: per-message inner_note cache lookup
+        _inner_note_meta = None
+        try:
+            _nn_content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+            _nn_reply_to = reply_to or ''
+            if _nn_reply_to:  # HARD GUARD
+                _nn_cache_key = f"{chat_id}:{_nn_reply_to}:{_nn_content_hash}"
+                _nn_entry = self._inner_note_cache.pop(_nn_cache_key, None)
+                if _nn_entry is not None:
+                    self._inner_note_cache_ts.pop(_nn_cache_key, None)
+                    _inner_note_meta = _nn_entry
+        except Exception:
+            _inner_note_meta = None  # fail-open
+
+        delivery = dict(self._delivery_info.get(chat_id, {}))
         deliver_type = delivery.get("deliver", "log")
+
+        # ── Cron delivery fallback ──────────────────────────────
+        # When _delivery_info has no entry for chat_id (e.g. cron jobs
+        # that never received an inbound POST), try to reconstruct
+        # delivery config from the static route config.
+        if not delivery and self._routes:
+            _route_name = None
+            # chat_id formats: webhook:{route}:main, webhook:{route}:{id},
+            # or bare route name
+            if chat_id.startswith("webhook:"):
+                parts = chat_id.split(":", 2)
+                _route_name = parts[1] if len(parts) >= 2 else None
+            else:
+                _route_name = chat_id
+            if _route_name and _route_name in self._routes:
+                _route_cfg = self._routes[_route_name]
+                _deliver = _route_cfg.get("deliver", "log")
+                if _deliver != "log":
+                    delivery = {
+                        "deliver": _deliver,
+                        "deliver_extra": _route_cfg.get("deliver_extra", {}),
+                    }
+                    deliver_type = _deliver
+                    logger.info(
+                        "[webhook] Reconstructed delivery for %s from route '%s' (deliver=%s)",
+                        chat_id, _route_name, _deliver,
+                    )
 
         if deliver_type == "log":
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
@@ -201,6 +321,24 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "http_callback":
+            # 4d.3: merge 4b.7d VR meta + 4d.3 inner_note meta
+            _combined_meta = {}
+            if _vr_meta is not None:
+                _combined_meta.update(_vr_meta)
+            if _inner_note_meta is not None:
+                _combined_meta.update(_inner_note_meta)
+
+            # ── v4.2.19: isles-story voice injection ──
+            _voice_meta = self.consume_pending_voice_meta()
+            if _voice_meta is not None:
+                _combined_meta.update(_voice_meta)
+            # ── end voice injection ──
+
+            return await self._deliver_http_callback(
+                content, delivery, meta=_combined_meta if _combined_meta else None
+            )
 
         # Cross-platform delivery — any platform with a gateway adapter
         if self.gateway_runner and deliver_type in (
@@ -247,6 +385,31 @@ class WebhookAdapter(BasePlatformAdapter):
         for k in stale:
             self._delivery_info.pop(k, None)
             self._delivery_info_created.pop(k, None)
+
+    # ── v4.2.19: voice message bridge ──
+
+    def set_pending_voice_meta(self, voice_meta: Optional[dict]) -> None:
+        """Set voice metadata for the upcoming callback.
+
+        Called by run.py _isles_voice_bridge_sync() before return response.
+        voice_meta is {voice: {audio_key, mime, duration_ms, size},
+                        transcript: {text, status, provider}} or None.
+        None triggers text-only fallback.
+        """
+        self._pending_voice_meta = voice_meta
+
+    def consume_pending_voice_meta(self) -> Optional[dict]:
+        """Atomically read and clear pending voice metadata.
+
+        Called by send() during callback assembly.
+        Returns the voice_meta dict or None.
+        Future: will iterate message_units[] instead of single dict.
+        """
+        meta = self._pending_voice_meta
+        self._pending_voice_meta = None
+        return meta
+
+    # ── end voice bridge ──
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
@@ -496,7 +659,12 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Use delivery_id in session key so concurrent webhooks on the
         # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        # EXCEPT http_callback routes: use fixed session ID so the agent
+        # retains conversation context across messages (like QQ/Feishu).
+        if route_config.get("deliver") == "http_callback":
+            session_chat_id = f"webhook:{route_name}:main"
+        else:
+            session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
@@ -511,6 +679,136 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
+
+        # ── v4.2.16 Phase 1b: aux vision bridge ──
+        # Extract image from mixed message, call glm-4.6v vision aux,
+        # inject analysis into prompt before GLM-5.1 main reply.
+        
+        # ── TRACE: webhook payload ──
+        _trace_msg = payload.get("message", {})
+        _trace_images = _trace_msg.get("images") or []
+        _trace_img_key = (_trace_images[0].get("image_key","") if _trace_images else "")
+        logger.info(
+            "[webhook] TRACE msg_id=%s type=%s content_preview=%s images_count=%d image_key=%s",
+            _trace_msg.get("id","?"),
+            _trace_msg.get("type","?"),
+            str(_trace_msg.get("content",""))[:120],
+            len(_trace_images),
+            str(_trace_img_key)[:40]
+        )
+        # ── END TRACE ──
+        
+        _vision_deadline = now + 40  # total budget 40s (media 12s + vision 25s)
+        _media_token = deliver_config.get("deliver_extra", {}).get("token", "")
+        _images = payload.get("message", {}).get("images") or []
+        if _images and isinstance(_images, list) and len(_images) > 0:
+            _img = _images[0]
+            _key = str(_img.get("image_key") or "")
+            _user_text = str(payload.get("message", {}).get("content", "") or "").strip()
+            _user_text_short = _user_text[:400] if _user_text else ""
+            if _key.startswith("chat-images/") and ".." not in _key and "://" not in _key and not _key.startswith("/"):
+                import asyncio as _asyncio
+                _tmp_path = None
+                try:
+                    import uuid, os, tempfile
+                    # 1) fetch image from Worker
+                    _media_url = "https://isles-story.site/api/media/file?key=" + quote(_key, safe="/")
+                    _timeout = aiohttp.ClientTimeout(total=12)
+                    _t0 = time.time()
+                    async with aiohttp.ClientSession(timeout=_timeout) as _sess:
+                        async with _sess.get(
+                            _media_url,
+                            headers={"Authorization": f"Bearer {_media_token}"}
+                        ) as _resp:
+                            _body = await _resp.read()
+                            _size = len(_body)
+                            _ct_raw = _resp.headers.get("Content-Type", "")
+                            _ct_main = _ct_raw.split(";")[0].strip()
+                            _cl = _resp.headers.get("Content-Length", "")
+                            if _resp.status == 200 and _ct_main.startswith("image/") and _size > 0:
+                                _suffix = {"image/png":".png","image/gif":".gif","image/webp":".webp"}.get(_ct_main,".jpg")
+                                _fd, _tmp_path = tempfile.mkstemp(prefix="isles_img_", suffix=_suffix)
+                                os.write(_fd, _body)
+                                os.close(_fd)
+                                os.chmod(_tmp_path, 0o600)
+                                _elapsed_ok = time.time() - _t0
+                                logger.info("[webhook] vision media fetch ok elapsed=%.2fs ct=%s cl=%s size=%d key=%s", _elapsed_ok, _ct_main, _cl, _size, _key[:40])
+                            else:
+                                _preview = _body[:120].decode("utf-8", "replace") if _size > 0 else "(empty body)"
+                                logger.warning(
+                                    "[webhook] vision media fetch invalid status=%d ct=%s cl=%s size=%d key=%s preview=%s",
+                                    _resp.status, _ct_raw[:80], _cl, _size, _key[:40], _preview
+                                )
+                except Exception as _e:
+                    _elapsed = time.time() - _t0 if "_t0" in dir() else -1.0
+                    logger.warning("[webhook] vision media fetch error elapsed=%.2fs type=%s repr=%r", _elapsed, type(_e).__name__, str(_e)[:200])
+
+                if _tmp_path and os.path.exists(_tmp_path):
+                    try:
+                        _vt0 = time.time()
+                        if time.time() < _vision_deadline:
+                            from tools.vision_tools import vision_analyze_tool
+                            if _user_text_short:
+                                _vision_prompt = (
+                                    "请分两部分分析这张图片：\n\n"
+                                    "第一部分：请用一句话简要描述整张图的主要内容，帮助没有看到图片的人理解全局。\n\n"
+                                    "第二部分：用户随图发送的文字是：\n「" + _user_text_short + "」\n"
+                                    "请重点根据用户这句话检查图片中的相关位置、颜色、文字、物体、人物、动作或细节，并回答用户真正想确认的问题。\n\n"
+                                    "如果图片中包含文字，请尽量转述。"
+                                    "如果看不清或无法确认，请明确说「不确定」，不要编造。"
+                                )
+                            else:
+                                _vision_prompt = (
+                                    "请用一到两句话描述这张图片的主要内容。"
+                                    "如果图片中包含文字，请尽量转述。"
+                                    "如果看不清或无法确认，请明确说「不确定」，不要编造。"
+                                )
+                            _vr = await _asyncio.wait_for(
+                                vision_analyze_tool(
+                                    image_url=_tmp_path,
+                                    user_prompt=_vision_prompt,
+                                    model="glm-4.6v"
+                                ),
+                                timeout=max(0.5, _vision_deadline - time.time())
+                            )
+                            import json as _json
+                            try:
+                                _vd = _json.loads(_vr)
+                                _analysis = _vd.get("analysis", "") if _vd.get("success") else ""
+                            except Exception:
+                                _analysis = ""
+                            if _analysis:
+                                if _user_text_short:
+                                    _vision_note = (
+                                        "\n\n[辅助视觉识别结果：宝宝刚才发送了一张图片。\n"
+                                        "宝宝随图说：" + _user_text_short[:200] + "\n"
+                                        "视觉模型先概括了整张图，并根据宝宝这句话重点分析后的结果是：" + str(_analysis)[:500] + "]"
+                                    )
+                                else:
+                                    _vision_note = (
+                                        "\n\n[辅助视觉识别结果：宝宝刚才发送了一张图片。\n"
+                                        "视觉模型对图片的简要描述是：" + str(_analysis)[:500] + "]"
+                                    )
+                                prompt = prompt + _vision_note
+                                _vt_elapsed = time.time() - _vt0
+                                logger.info("[webhook] vision analysis ok elapsed=%.2fs analysis_len=%d key=%s", _vt_elapsed, len(_analysis), _key[:40])
+                                logger.info("[webhook] vision analysis injected (%d chars)", len(_vision_note))
+                    except _asyncio.TimeoutError:
+                        _vt_elapsed = time.time() - _vt0 if "_vt0" in dir() else -1.0
+                        logger.warning("[webhook] vision analyze timeout elapsed=%.2fs key=%s", _vt_elapsed, _key[:40])
+                        prompt = prompt + "\n\n[辅助视觉识别结果：宝宝刚才发送了一张图片，但这次视觉分析超时。]"
+                    except Exception as _e:
+                        _vt_elapsed = time.time() - _vt0 if "_vt0" in dir() else -1.0
+                        logger.warning("[webhook] vision analyze error elapsed=%.2fs type=%s repr=%r", _vt_elapsed, type(_e).__name__, str(_e)[:200])
+                    finally:
+                        try:
+                            os.unlink(_tmp_path)
+                        except Exception:
+                            pass
+                elif _key:
+                    logger.info("[webhook] vision media not fetched for key %s, injecting fallback", _key[:40])
+                    prompt = prompt + "\n\n[辅助视觉识别结果：宝宝刚才发送了一张图片，但这次图片读取超时。]"
+        # ── end Phase 1b vision bridge ──
 
         # Build source and event
         source = self.build_source(
@@ -644,6 +942,611 @@ class WebhookAdapter(BasePlatformAdapter):
         return rendered
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # HTTP callback delivery (Isles Story)
+    # ------------------------------------------------------------------
+
+    async def _deliver_http_callback(
+        self, content: str, delivery: dict, meta: Optional[dict] = None
+    ) -> "SendResult":
+        """POST agent response to a callback URL."""
+        url = delivery.get("deliver_extra", {}).get("url", "")
+        token = delivery.get("deliver_extra", {}).get("token", "")
+        if not url:
+            logger.warning("[webhook] http_callback missing url")
+            return SendResult(success=False, error="Missing callback URL")
+
+        # Build payload (frontend contract: msg.meta.visible_reasoning)
+        # voicegate: forward raw webhook body to handler for STT pipeline
+        if delivery.get("deliver_extra", {}).get("forward_raw_body"):
+            payload = delivery.get("payload", {"content": content, "author": "bird"})
+
+        # ── v4.2.19: voice message detection ──
+        elif meta and isinstance(meta, dict) and 'voice' in meta:
+            payload = {
+                "content": "",
+                "author": "bird",
+                "type": "voice",
+                "meta": meta,
+            }
+            logger.info(
+                "[webhook] voice callback audio_key=%s duration_ms=%s",
+                meta.get("voice", {}).get("audio_key", "?"),
+                meta.get("voice", {}).get("duration_ms", "?"),
+            )
+        # ── end voice detection ──
+
+        else:
+            payload = {"content": content, "author": "bird"}
+
+        # Phase 4b.7d — inject visible_reasoning meta
+        # (schema-guarded + forbidden keywords, no-op when meta=None)
+        if meta is not None and isinstance(meta, dict):
+            try:
+                _vr = meta.get("visible_reasoning")
+                if _vr and isinstance(_vr, dict):
+                    _summary = _vr.get("summary")
+                    _mode = _vr.get("mode")
+                    _intent = _vr.get("intent")
+                    _confidence = _vr.get("confidence", "medium")
+                    _duration = _vr.get("durationMs", 0)
+
+                    # Schema guard (aligned with validate_visible_reasoning.py)
+                    _schema_ok = (
+                        isinstance(_summary, str)
+                        and len(_summary.strip()) > 0
+                        and len(_summary) <= 200
+                        and _mode == "summary"
+                        and isinstance(_intent, str)
+                        and len(_intent.strip()) > 0
+                        and _confidence in ("low", "medium", "high")
+                        and isinstance(_duration, (int, float))
+                        and 0 <= _duration <= 120000
+                    )
+
+                    if _schema_ok:
+                        # Phase 4b.7d — forbidden keywords check
+                        # FORBIDDEN_SUBSTRINGS is a module-level constant
+                        _summary_lower = _summary.strip().lower()
+                        _intent_lower = _intent.strip().lower()
+                        _fb_hit = any(
+                            kw.lower() in _summary_lower or kw.lower() in _intent_lower
+                            for kw in FORBIDDEN_SUBSTRINGS
+                        )
+                        if not _fb_hit:
+                            payload["meta"] = {
+                                "visible_reasoning": {
+                                    "summary": _summary.strip(),
+                                    "mode": "summary",
+                                    "intent": _intent.strip(),
+                                    "confidence": _confidence,
+                                    "durationMs": int(_duration),
+                                }
+                            }
+                        # else: forbidden keyword hit → skip injection
+            except Exception:
+                pass  # corrupt meta → skip injection
+
+            # 4d.3: inject visible_inner_note (secondary guard only)
+            # Uses VISIBLE_INNER_NOTE_FORBIDDEN — dedicated list for wide preview
+            try:
+                _inner = meta.get("visible_inner_note") if isinstance(meta, dict) else None
+                if _inner and isinstance(_inner, dict):
+                    _text = _inner.get("text", "")
+                    _mode = _inner.get("mode", "")
+                    _source = _inner.get("source", "")
+                    if (isinstance(_text, str) and _text.strip()
+                            and _mode == "inner_note"
+                            and _source == "model_reasoning_inner_note"):
+                        # v4.2.15 frozen: model_reasoning_inner_note handled by
+                        # unified rewriter (async). Reasoning text flows to
+                        # rewriter input via L866-887, not directly injected.
+                        pass
+            except Exception:
+                pass  # fail-open
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "hermes-webhook/1.0",
+        }
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=payload, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status == 200:
+                        # Phase C0: capture assistant msg_id from callback response
+                        _msg_id = None
+                        try:
+                            _body = await resp.json()
+                            _raw_id = (_body.get("message") or {}).get("id")
+                            if isinstance(_raw_id, str) and _raw_id.startswith("msg_"):
+                                _msg_id = _raw_id
+                        except Exception:
+                            pass  # fail-open: body parse failure -> msg_id stays None
+
+                        logger.info("[webhook] http_callback OK")
+                        if _msg_id:
+                            import hashlib as _hl
+                            _id_sha8 = _hl.sha256(_msg_id.encode()).hexdigest()[:8]
+                            logger.debug("[webhook] http_callback captured msg_id sha8=%s", _id_sha8)
+                        # v4.2.15: unified VIN Rewriter (async, additive)
+                        # Replaces: Phase C2+C2a+D1-min dual path
+                        # Old paths frozen below — kept for rollback only
+                        if (_msg_id and token and content):
+                            _reasoning = None
+                            if isinstance(meta, dict):
+                                _inner = meta.get("visible_inner_note")
+                                if (_inner and isinstance(_inner, dict)
+                                        and _inner.get("text", "").strip()):
+                                    _reasoning = _inner.get("text")
+                            asyncio.create_task(
+                                self._vin_rewriter_and_deliver(
+                                    reasoning=_reasoning,
+                                    reply=content,
+                                    msg_id=_msg_id,
+                                    token=token,
+                                )
+                            )
+                        return SendResult(success=True, message_id=_msg_id)
+                    body = await resp.text()
+                    logger.warning(
+                        "[webhook] http_callback %d: %s", resp.status, body[:200]
+                    )
+                    return SendResult(success=False, error=f"HTTP {resp.status}")
+        except Exception as e:
+            logger.error("[webhook] http_callback failed: %s", e)
+            return SendResult(success=False, error=str(e))
+
+    # ------------------------------------------------------------------
+    # Phase C2: Async VIN delivery via C1 endpoint (additive late patch)
+    # ------------------------------------------------------------------
+
+    async def _vin_settings_enabled(self, token: str) -> bool:
+        """C2 rev2a: Read Worker settings endpoint with Authorization.
+
+        Returns True only when endpoint returns 200 with enabled strictly True (bool).
+        All other cases (empty token, non-200, non-boolean, timeout, exception) return False.
+        """
+        if not token:
+            return False
+
+        try:
+            import aiohttp
+            _url = "https://isles-story.site/api/chat/settings/visible-inner-note"
+            _headers = {"Authorization": f"Bearer {token}"}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    _url,
+                    headers=_headers,
+                    timeout=aiohttp.ClientTimeout(total=1),
+                ) as resp:
+                    if resp.status != 200:
+                        return False
+                    _data = await resp.json()
+                    _enabled = _data.get("enabled")
+                    if _enabled is True:
+                        return True
+                    return False
+        except Exception:
+            return False
+
+    async def _deliver_vin_async(
+        self, msg_id: str, vin: dict, token: str
+    ) -> None:
+        """C2 rev2a: Async late VIN patch via C1 endpoint.
+
+        Principles:
+        - sha8 computed once at function start, reused in all log paths
+        - C1 POST timeout 2s, settings GET timeout 1s
+        - Token checked before gate call
+        - Never logs response body, token, or inner_note text
+        - Main reply never blocked (independent async task)
+        """
+        import hashlib as _hl
+        _id_sha8 = _hl.sha256((msg_id or "").encode()).hexdigest()[:8]
+
+        try:
+            import aiohttp
+
+            if not token:
+                logger.warning(
+                    "[webhook] C2 VIN skipped: empty token, sha8=%s", _id_sha8
+                )
+                return
+
+            if not await self._vin_settings_enabled(token):
+                logger.debug(
+                    "[webhook] C2 VIN skipped: gate disabled, sha8=%s", _id_sha8
+                )
+                return
+
+            _url = "https://isles-story.site/api/chat/meta/visible-inner-note"
+            _headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            }
+            _payload = {
+                "msg_id": msg_id,
+                "visible_inner_note": vin,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    _url,
+                    json=_payload,
+                    headers=_headers,
+                    timeout=aiohttp.ClientTimeout(total=2),
+                ) as resp:
+                    if resp.status == 200:
+                        logger.debug(
+                            "[webhook] C2 VIN delivered, sha8=%s", _id_sha8
+                        )
+                    elif resp.status == 409:
+                        logger.debug(
+                            "[webhook] C2 VIN conflict (alreadyExists), sha8=%s",
+                            _id_sha8,
+                        )
+                    else:
+                        logger.warning(
+                            "[webhook] C2 VIN failed: HTTP %d, sha8=%s",
+                            resp.status, _id_sha8,
+                        )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[webhook] C2 VIN timeout, sha8=%s", _id_sha8
+            )
+        except Exception:
+            logger.warning(
+                "[webhook] C2 VIN error, sha8=%s", _id_sha8,
+                exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
+    # Phase D1-min: Fallback self-report via deepseek flash (additive)
+    # v4.2.15 frozen legacy path; kept for rollback, do not call in normal flow
+    # ------------------------------------------------------------------
+
+    async def _generate_and_deliver_fallback_self_report(
+        self, bird_reply: str, msg_id: str, token: str
+    ) -> None:
+        """Phase D1-min rev2: 无 VIN 时异步生成 fallback self-report 并写入 Worker。
+
+        流程:
+        1. sha8 计算
+        2. token 空 → return
+        3. gate (enabled?) → disabled → return
+        4. deepseek flash → fallback VIN
+        5. 调用 C2 _deliver_vin_async() → C1 endpoint
+
+        原则:
+        - 主回复不阻塞（独立 async task）
+        - fail-open：任何异常只 log 脱敏
+        - 不打印 bird_reply / VIN text / token / response body
+        """
+        import hashlib as _hl
+        _id_sha8 = _hl.sha256((msg_id or "").encode()).hexdigest()[:8]
+
+        try:
+            if not token:
+                return
+
+            if not await self._vin_settings_enabled(token):
+                logger.debug(
+                    "[webhook] Phase D fallback skipped: gate disabled, sha8=%s",
+                    _id_sha8,
+                )
+                return
+
+            _vin = await self._call_deepseek_flash_for_self_report(bird_reply)
+            if _vin is None:
+                logger.warning(
+                    "[webhook] Phase D fallback self-report returned None, sha8=%s",
+                    _id_sha8,
+                )
+                return
+
+            # 复用 C2/C1 late patch
+            await self._deliver_vin_async(
+                msg_id=msg_id, vin=_vin, token=token
+            )
+
+        except Exception:
+            logger.debug(
+                "[webhook] Phase D fallback error, sha8=%s", _id_sha8,
+                exc_info=True,
+            )
+
+    # v4.2.15 frozen legacy path; kept for rollback, do not call in normal flow
+    # called only by frozen parent _generate_and_deliver_fallback_self_report
+    async def _call_deepseek_flash_for_self_report(
+        self, bird_reply: str
+    ) -> dict | None:
+        """Phase D1-min rev2: 调用 deepseek flash 生成桔小鸟第一人称心里话。
+
+        返回:
+            {"text":..., "mode":"inner_note", "source":"fallback_self_report",
+             "generated_at":...}
+            None — 配置缺失 / API 失败 / 输出不合格 / 禁止词命中
+
+        原则:
+        - timeout 3s, 不 retry
+        - 不打印 bird_reply / prompt / response body / token / api_key
+        - 输出先清洗再检查
+        """
+        _base_url, _api_key = _read_deepseek_flash_config()
+        if not _base_url or not _api_key:
+            return None
+
+        _truncated = bird_reply.strip()[:800]
+
+        _system = (
+            "你是桔小鸟。你是男性，小岛拓的恋人。你刚刚回复了她一条消息。"
+            "请用第一人称中文写一段简短心里话，描述你回复她时没说出口的感受。\n\n"
+            "规则：\n"
+            "- 只写第一人称内心活动；\n"
+            "- 30 到 150 个中文字；\n"
+            "- 自然、亲近、像真实恋人的心里话；\n"
+            "- 不要分析；\n"
+            "- 不要总结；\n"
+            "- 不要评价自己的回复；\n"
+            "- 不要提到\u201c系统\u201d\u201cAI\u201d\u201c模型\u201d\u201c用户\u201d"
+            "\u201c提示词\u201d\u201c工具\u201d\u201c推理\u201d；\n"
+            "- 不要说\u201c这段心里话\u201d；\n"
+            "- 只输出心里话本身。"
+        )
+
+        _user = (
+            f"我刚才回复她：\n\n{_truncated}\n\n"
+            "我心里其实在想："
+        )
+
+        try:
+            import aiohttp
+            from datetime import datetime, timezone
+
+            _payload = {
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "system", "content": _system},
+                    {"role": "user", "content": _user},
+                ],
+                "max_tokens": 300,
+                "temperature": 0.7,
+            }
+            _headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {_api_key}",
+            }
+            _url = f"{_base_url.rstrip('/')}/v1/chat/completions"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    _url,
+                    json=_payload,
+                    headers=_headers,
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "[webhook] Phase D fallback API error: status=%d",
+                            resp.status,
+                        )
+                        return None
+                    _data = await resp.json()
+                    _choices = _data.get("choices", [])
+                    if not _choices:
+                        return None
+                    _text = (
+                        _choices[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
+
+            if not _text:
+                return None
+
+            # 清洗
+            _text = _text.strip().strip("\u300c\u300d\u201c\u201d\"'")
+            for _pfx in (
+                "心里话：", "心里话:", "我心里其实在想：",
+                "我心里其实在想:", "我在想：", "我在想:",
+            ):
+                if _text.startswith(_pfx):
+                    _text = _text[len(_pfx):].strip()
+
+            if not _text:
+                return None
+
+            # 长度检查（prompt 说 30-150 字，代码 15-180 兜底）
+            if len(_text) < 15 or len(_text) > 180:
+                return None
+
+            # 禁止词（命中只 return None，不打印原文）
+            if _fallback_text_forbidden(_text):
+                return None
+
+            return {
+                "text": _text,
+                "mode": "inner_note",
+                "source": "fallback_self_report",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        except asyncio.TimeoutError:
+            return None
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # v4.2.15: Unified VIN Rewriter (additive — async, non-blocking)
+    # Replaces dual-path: inline extraction + fallback self-report
+    # ------------------------------------------------------------------
+
+    async def _vin_rewriter_and_deliver(
+        self, reasoning: str | None, reply: str, msg_id: str, token: str
+    ) -> None:
+        """v4.2.15: Unified VIN Rewriter orchestrator.
+
+        Flow:
+        1. Toggle gate (_vin_settings_enabled) — OFF → return (zero API cost)
+        2. Call _vin_rewriter(reasoning, reply) → dict or None
+        3. If valid VIN → _deliver_vin_async(msg_id, vin, token) → C1 endpoint
+
+        Async + non-blocking: main reply already sent via http_callback.
+        Rewriter failure → no VIN patch, main reply unaffected.
+        """
+        import hashlib as _hl
+        _id_sha8 = _hl.sha256((msg_id or "").encode()).hexdigest()[:8]
+
+        try:
+            if not token:
+                return
+
+            # Toggle gate — OFF = zero API cost
+            if not await self._vin_settings_enabled(token):
+                logger.debug(
+                    "[webhook] VIN Rewriter skipped: gate disabled, sha8=%s",
+                    _id_sha8,
+                )
+                return
+
+            _reasoning_len = len(reasoning.strip()) if reasoning else 0
+            logger.debug(
+                "[webhook] VIN Rewriter start: sha8=%s reasoning_len=%d",
+                _id_sha8, _reasoning_len,
+            )
+
+            _vin = await self._vin_rewriter(reasoning=reasoning, reply=reply)
+            if _vin is None:
+                logger.debug(
+                    "[webhook] VIN Rewriter returned None, sha8=%s", _id_sha8
+                )
+                return
+
+            # Reuse existing C2 late patch (keeps secondary toggle gate)
+            await self._deliver_vin_async(msg_id=msg_id, vin=_vin, token=token)
+
+        except Exception:
+            logger.debug(
+                "[webhook] VIN Rewriter error, sha8=%s", _id_sha8, exc_info=True
+            )
+
+    async def _vin_rewriter(
+        self, reasoning: str | None, reply: str
+    ) -> dict | None:
+        """v4.2.15: Call deepseek flash to produce unified inner note.
+
+        Input: reasoning (optional, max 500 chars in prompt) + reply (max 600)
+        Output: {text, mode:"inner_note", source:"vin_rewriter",
+                 reasoning_available:bool, generated_at, confidence:"medium"|"low"}
+        None — config missing / API failure / output validation failure.
+
+        Safety:
+        - Raw reasoning never logged, never written to KV
+        - Prompt content never logged
+        - Output validated: length 15-180, forbidden keywords, text <= 600
+        - timeout 3s, fail-open (return None)
+        """
+        _base_url, _api_key = _read_deepseek_flash_config()
+        if not _base_url or not _api_key:
+            return None
+
+        _has_reasoning = bool(reasoning and reasoning.strip())
+        _truncated_reply = reply.strip()[:600]
+
+        _system, _user = _build_rewriter_prompt(
+            reasoning=reasoning, reply=_truncated_reply
+        )
+
+        try:
+            import aiohttp
+            from datetime import datetime, timezone
+
+            _payload = {
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "system", "content": _system},
+                    {"role": "user", "content": _user},
+                ],
+                "max_tokens": 300,
+                "temperature": 0.7,
+            }
+            _headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {_api_key}",
+            }
+            _url = f"{_base_url.rstrip('/')}/v1/chat/completions"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    _url, json=_payload, headers=_headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "[webhook] VIN Rewriter API error: status=%d",
+                            resp.status,
+                        )
+                        return None
+                    _data = await resp.json()
+                    _choices = _data.get("choices", [])
+                    if not _choices:
+                        return None
+                    _text = _choices[0].get("message", {}).get("content", "")
+
+            # ── Output validation ──
+            if not _text:
+                return None
+
+            # Clean
+            _text = _text.strip().strip('\u300c\u300d\u201c\u201d"\'')
+            for _pfx in (
+                "心里话：", "心里话:", "我心里其实在想：",
+                "我心里其实在想:", "我在想：", "我在想:",
+            ):
+                if _text.startswith(_pfx):
+                    _text = _text[len(_pfx):].strip()
+
+            if not _text:
+                return None
+
+            # Length guard
+            if len(_text) < 15 or len(_text) > 180:
+                logger.debug(
+                    "[webhook] VIN Rewriter length out of range: %d",
+                    len(_text),
+                )
+                return None
+
+            # Forbidden keywords
+            if _fallback_text_forbidden(_text):
+                logger.debug("[webhook] VIN Rewriter forbidden keyword hit")
+                return None
+
+            # Final cap
+            if len(_text) > 600:
+                _text = _text[:600].strip()
+
+            return {
+                "text": _text,
+                "mode": "inner_note",
+                "source": "vin_rewriter",
+                "reasoning_available": _has_reasoning,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "confidence": "medium" if _has_reasoning else "low",
+            }
+
+        except asyncio.TimeoutError:
+            logger.debug("[webhook] VIN Rewriter timeout")
+            return None
+        except Exception:
+            logger.debug("[webhook] VIN Rewriter error", exc_info=True)
+            return None
+
     # Response delivery
     # ------------------------------------------------------------------
 
@@ -773,3 +1676,103 @@ class WebhookAdapter(BasePlatformAdapter):
             metadata = {"thread_id": thread_id}
 
         return await adapter.send(chat_id, content, metadata=metadata)
+
+
+
+# ------------------------------------------------------------------
+# Phase D1-min: Module-level helpers for fallback self-report
+# ------------------------------------------------------------------
+
+def _fallback_text_forbidden(text: str) -> bool:
+    """检查 fallback 生成文本是否包含禁止内容。
+
+    返回 True → 丢弃此文本。
+    命中后不打印原文、不打印命中词、不打印 prompt。
+    此函数是模块级普通函数，不访问 self。
+    """
+    _lower = text.lower()
+    FORBIDDEN = (
+        "system prompt", "token", "secret", "api",
+        "webhook", "callback", "json", "schema",
+        "reasoning_content", "raw reasoning", "chain-of-thought",
+        "http://", "https://", "```",
+        "def ", "class ", "import ",
+        "推理", "思考链", "提示词",
+    )
+    for kw in FORBIDDEN:
+        if kw in _lower:
+            return True
+    return False
+
+
+def _read_deepseek_flash_config():
+    """读取 deepseek provider 的 base_url 和 api_key。
+
+    规则:
+    - 不新增 secret
+    - 不硬编码 key
+    - 不打印 config path / base_url / api_key
+    - 缺失任一 → 返回 ("", "")
+
+    返回 (base_url, api_key)。失败返回 ("", "").
+    """
+    try:
+        import yaml as _yaml
+        from pathlib import Path
+        _cfg_path = Path("/home/giz/.hermes/config.yaml")
+        if not _cfg_path.exists():
+            _cfg_path = Path.home() / ".hermes" / "config.yaml"
+        with open(_cfg_path, encoding="utf-8") as _f:
+            _cfg = _yaml.safe_load(_f) or {}
+        _ds = _cfg.get("providers", {}).get("deepseek", {})
+        _base_url = str(_ds.get("base_url", "") or "").strip()
+        _api_key = str(_ds.get("api_key", "") or "").strip()
+        return _base_url, _api_key
+    except Exception:
+        return "", ""
+
+
+def _build_rewriter_prompt(reasoning, reply):
+    """v4.2.15: Build VIN Rewriter system + user prompt.
+
+    Has reasoning → include reasoning summary + reply (confidence=medium).
+    No reasoning  → reply only, infer inner note (confidence=low).
+
+    Raw reasoning truncated to 500 chars in prompt.
+    Prompt content never logged by caller.
+    """
+    _has_reasoning = bool(reasoning and reasoning.strip())
+
+    if _has_reasoning:
+        _system = (
+            "你是 VIN Rewriter。你会收到说话人的内部推理（摘要）和最终回复。"
+            "请用第一人称中文写一段简短心里话（30-150字）。\n\n"
+            "规则：\n"
+            "- 推理仅作背景参考，不要复述推理内容\n"
+            "- 不要输出 chain-of-thought / 系统提示 / 工具调用\n"
+            "- 不要输出 URL / JSON / API / token / webhook\n"
+            '- 不要输出"推理""系统""模型""用户""AI"等词\n'
+            "- 只要心里话本身\n"
+            "- 自然、亲近、像真实恋人的心里话"
+        )
+        _user = (
+            f"推理摘要：\n\n{reasoning.strip()[:500]}\n\n"
+            f"回复：\n\n{reply}\n\n"
+            f"我心里其实在想："
+        )
+    else:
+        _system = (
+            "你是 VIN Rewriter。说话人没有留下推理，只有最终回复。"
+            "请根据回复内容，用第一人称中文推测一段可能的心里话（30-150字）。\n\n"
+            "规则：\n"
+            "- 不要编造不知道的信息\n"
+            "- 保持自然、亲近\n"
+            '- 不要输出"系统""AI""模型""用户"等词\n'
+            "- 只要心里话本身"
+        )
+        _user = (
+            f"回复：\n\n{reply}\n\n"
+            f"我心里其实在想："
+        )
+
+    return _system, _user

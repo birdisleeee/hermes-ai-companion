@@ -960,7 +960,7 @@ class SessionStore:
             )
         return len(removed_keys)
 
-    def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
+    def suspend_recently_active(self, max_age_seconds: int = 5) -> int:
         """Mark recently-active sessions as suspended.
 
         Called on gateway startup to prevent sessions that were likely

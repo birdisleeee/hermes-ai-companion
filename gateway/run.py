@@ -24,6 +24,7 @@ import signal
 import tempfile
 import threading
 import time
+import hashlib
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -344,6 +345,10 @@ logger = logging.getLogger(__name__)
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+# ── v4.2.19: isles-story voice bridge timeouts ──
+TTS_TIMEOUT = 15       # MiniMax TTS API max wait (seconds)
+UPLOAD_TIMEOUT = 10    # Worker /api/media/voice/upload max wait (seconds)
+
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
@@ -562,6 +567,619 @@ def _parse_session_key(session_key: str) -> "dict | None":
             result["thread_id"] = parts[5]
         return result
     return None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v4.2.8 Phase 2.2-a — Heartbeat read-only probe (isles-story only)
+# Isolation:
+#   - ONLY isles-story scope gate (giz × isles-story webhook route) may peek.
+#   - Read-only via /api/heartbeat/event/peek (no KV writes).
+#   - No write to chat:index:main; no /api/chat/messages contamination.
+#   - Fail-open; same-event_id dedupe via _heartbeat_last_event_id.
+#   - DOES NOT participate in media / voice / call / gift / moments paths.
+# Phase 2.2-a constraint:
+#   - Probe ONLY: log event_id at DEBUG, do NOT splice into combined_ephemeral.
+# ──────────────────────────────────────────────────────────────────────
+_heartbeat_last_event_id: dict = {}
+
+
+def _get_heartbeat_token() -> str:
+    """Read TOKEN_HERMES from giz config.yaml (deliver_extra.token).
+
+    Returns empty string on any failure (caller fail-opens).
+    Never logs the plaintext token.
+    """
+    try:
+        import yaml as _yaml
+        _cfg_path = Path.home() / ".hermes" / "config.yaml"
+        if not _cfg_path.exists():
+            # Fall back to giz user home (gateway runs as giz)
+            _cfg_path = Path("/home/giz/.hermes/config.yaml")
+        with open(_cfg_path, encoding="utf-8") as _f:
+            _cfg = _yaml.safe_load(_f) or {}
+        _token = (
+            _cfg.get("platforms", {})
+                .get("webhook", {})
+                .get("extra", {})
+                .get("routes", {})
+                .get("isles-story", {})
+                .get("deliver_extra", {})
+                .get("token", "")
+        )
+        return str(_token or "").strip()
+    except Exception:
+        return ""
+
+
+def _is_heartbeat_eligible(source, session_key: str) -> bool:
+    """Scope gate: only the isles-story webhook route may probe heartbeat.
+
+    Real session_key format observed in §3.1.1 testing:
+        ``agent:main:webhook:webhook:webhook:isles-story:main``
+    so we match by containment rather than prefix. qqbot / weixin / feishu
+    sessions never carry "isles-story" and are excluded.
+
+    Conditions (ANY hits):
+      - session_key contains "isles-story", OR
+      - source.platform == "webhook" AND source.user_id contains "isles-story"
+    """
+    try:
+        sk = str(session_key or "")
+        if "isles-story" in sk:
+            return True
+
+        platform = str(getattr(source, "platform", "") or "")
+        user_id = str(getattr(source, "user_id", "") or "")
+        if platform == "webhook" and "isles-story" in user_id:
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
+
+
+
+# v4.2.10-time-awareness Phase 1: code-level kill switch (default: enabled)
+TEMPORAL_AWARENESS_ENABLED = True
+
+def _is_temporal_context_eligible(source, session_key: str = "") -> bool:
+    """Scope gate: isles-story webhook/DM chats only.
+
+    Conditions (ALL must be true):
+      - chat_type is "webhook" or "dm" (excludes group/heartbeat/wechat/qq/feishu DM)
+      - At least one source field contains a known isles-story identifier
+
+    Identifiers: isles-story, isles, bird, xiaochu
+    """
+    try:
+        chat_type = str(getattr(source, "chat_type", "") or "")
+        if chat_type not in ("webhook", "dm"):
+            return False
+
+        identifiers = ("isles-story", "isles", "bird", "xiaochu")
+        fields = [
+            str(session_key or ""),
+            str(getattr(source, "user_id", "") or ""),
+            str(getattr(source, "channel_id", "") or ""),
+            str(getattr(source, "chat_id", "") or ""),
+            str(getattr(source, "route", "") or ""),
+            str(getattr(source, "platform", "") or ""),
+        ]
+        for fv in fields:
+            for ident in identifiers:
+                if ident in fv:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _build_temporal_context(history, source=None, session_key: str = "", user_message: str = "") -> str:
+    """Build [time_anchor] block for LLM ephemeral injection.
+
+    Phase 1.2 simple-time-anchor: no JST, no verdict, no complex parsing.
+    Returns empty string on fail-open.
+    """
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        if not _is_temporal_context_eligible(source, session_key):
+            return ""
+
+        # Compute Beijing time (UTC+8)
+        jst = timezone(timedelta(hours=9))
+        now_jst = datetime.now(jst)
+        cn = timezone(timedelta(hours=8))
+        now_cn = now_jst.astimezone(cn)
+        cn_time_str = now_cn.strftime("%H:%M")
+        cn_date_str = now_cn.strftime("%Y-%m-%d")
+
+        # Weekday in Chinese
+        _weekdays = ["\u5468\u4e00", "\u5468\u4e8c", "\u5468\u4e09", "\u5468\u56db", "\u5468\u4e94", "\u5468\u516d", "\u5468\u65e5"]
+        weekday = _weekdays[now_cn.weekday()]
+
+        # Day period + negation guard
+        hour = now_cn.hour
+        _all_periods = ["\u65e9\u4e0a", "\u4e0a\u5348", "\u4e2d\u5348", "\u4e0b\u5348", "\u665a\u4e0a", "\u6df1\u591c"]
+        if 5 <= hour < 9:
+            day_period = "\u65e9\u4e0a"
+        elif 9 <= hour < 12:
+            day_period = "\u4e0a\u5348"
+        elif 12 <= hour < 13:
+            day_period = "\u4e2d\u5348"
+        elif 13 <= hour < 18:
+            day_period = "\u4e0b\u5348"
+        elif 18 <= hour < 23:
+            day_period = "\u665a\u4e0a"
+        else:
+            day_period = "\u6df1\u591c"
+
+        negated = [p for p in _all_periods if p != day_period]
+        guard = "\u5f53\u524d\u4e0d\u662f" + "\uff0c\u4e0d\u662f".join(negated) + "\u3002"
+
+        # Time gap detection (unchanged from Phase 1)
+        last_user_ts = None
+        if history:
+            for msg in reversed(history):
+                if msg.get("role") == "user":
+                    ts_val = msg.get("timestamp")
+                    if ts_val:
+                        try:
+                            if isinstance(ts_val, str):
+                                last_user_ts = datetime.fromisoformat(
+                                    ts_val.replace("Z", "+00:00"))
+                            elif isinstance(ts_val, (int, float)):
+                                last_user_ts = datetime.fromtimestamp(
+                                    ts_val, tz=timezone.utc)
+                            break
+                        except Exception:
+                            continue
+
+        if last_user_ts is None:
+            delta_str = "unknown"
+            time_state = "first_message_or_unknown"
+        else:
+            if last_user_ts.tzinfo is None:
+                last_user_ts = last_user_ts.replace(tzinfo=timezone.utc)
+            now_utc = now_jst.astimezone(timezone.utc)
+            delta = now_utc - last_user_ts.astimezone(timezone.utc)
+            total_minutes = delta.total_seconds() / 60
+
+            if total_minutes < 1:
+                delta_str = "\u4e0d\u52301\u5206\u949f"
+            elif total_minutes < 60:
+                delta_str = f"{int(total_minutes)}\u5206\u949f"
+            elif total_minutes < 1440:
+                h = int(total_minutes // 60)
+                m = int(total_minutes % 60)
+                delta_str = f"{h}\u5c0f\u65f6{m}\u5206\u949f" if m else f"{h}\u5c0f\u65f6"
+            else:
+                d = int(total_minutes // 1440)
+                h = int((total_minutes % 1440) // 60)
+                delta_str = f"{d}\u5929{h}\u5c0f\u65f6" if h else f"{d}\u5929"
+
+            now_local = now_jst.replace(tzinfo=None)
+            last_local = last_user_ts.astimezone(jst).replace(tzinfo=None)
+            is_overnight = now_local.date() > last_local.date()
+
+            if total_minutes <= 10:
+                time_state = "continuous"
+            elif total_minutes <= 60:
+                time_state = "short_gap"
+            elif total_minutes <= 180:
+                time_state = "medium_gap_return"
+            elif total_minutes <= 480:
+                time_state = "long_gap_return"
+            elif total_minutes <= 1080:
+                time_state = "very_long_gap_return"
+            elif is_overnight or total_minutes <= 1800:
+                time_state = "overnight_return"
+            else:
+                time_state = "next_day_or_later"
+
+        # Assemble [time_anchor] — unified format, no JST, no verdict
+        block = (
+            "[time_anchor]\n"
+            f"\u5f53\u524d\u7528\u6237\u672c\u5730\u65f6\u95f4\uff1a{cn_date_str} {weekday} {cn_time_str}\uff08\u5317\u4eac\u65f6\u95f4\uff0c{day_period}\uff09\n"
+            f"{guard}\n"
+            f"\u8ddd\u4e0a\u6761\u7528\u6237\u6d88\u606f\uff1a{delta_str}\uff08{time_state}\uff09\n"
+            "[/time_anchor]"
+        )
+        # Phase 1.2: verdict disabled, _build_time_verdict not called
+        return block
+
+    except Exception:
+        return ""
+# v4.2.10-time-awareness Phase 1.1: temporal verdict helpers
+
+_CN_DIGIT_MAP = {
+    "\u96f6": 0, "\u4e00": 1, "\u4e8c": 2, "\u4e09": 3, "\u56db": 4,
+    "\u4e94": 5, "\u516d": 6, "\u4e03": 7, "\u516b": 8, "\u4e5d": 9, "\u5341": 10,
+    "\u4e24": 2, "\u5eff": 20, "\u5345": 30,
+}
+_CN_COMPLETION_WORDS = {"\u4e86", "\u90a3\u4f1a\u513f", "\u521a\u624d", "\u5230\u5bb6\u4e86", "\u5df2\u7ecf"}
+_CN_PLAN_WORDS = {"\u7b49", "\u89c1", "\u5f00\u4f1a", "\u5f00\u59cb", "\u5230\u65f6\u5019"}
+
+
+def _parse_cn_number(s):
+    s = s.strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    if len(s) == 1:
+        return _CN_DIGIT_MAP.get(s)
+    result = 0
+    temp = 0
+    for ch in s:
+        d = _CN_DIGIT_MAP.get(ch)
+        if d is None:
+            return None
+        if d == 10:
+            if temp == 0:
+                temp = 1
+            result += temp * 10
+            temp = 0
+        else:
+            temp = d
+    result += temp
+    return result if result > 0 else None
+
+
+def _detect_chinese_time_expressions(text):
+    import re
+    from datetime import timedelta
+
+    results = []
+    if not text:
+        return results
+
+    clean = re.sub(r'^\[.*?\]\s*\n*', '', text, count=3)
+
+    # Pattern 1: explicit modifiers
+    explicit_pat = re.compile(
+        r'(\u65e9\u4e0a|\u4e0a\u5348|\u4e2d\u5348|\u4e0b\u5348|\u665a\u4e0a|\u4eca\u665a|\u660e\u5929\u4e0a\u5348|\u660e\u5929\u4e0b\u5348|\u660e\u5929\u665a\u4e0a|\u660e\u5929|\u540e\u5929)'
+        r'(\d{1,2}|[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u4e24\u5eff\u5345]+)'
+        r'(?:\u70b9\u534a|\u534a\u70b9|\u70b9(\d{1,2}|[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u4e24]+)(?:\u5206)?|\u70b9)',
+    )
+    for m in explicit_pat.finditer(clean):
+        modifier = m.group(1)
+        hour_raw = m.group(2)
+        minute_raw = m.group(3)
+        is_half = "\u534a" in m.group(0)
+        hour = _parse_cn_number(hour_raw)
+        if hour is None or hour > 24:
+            continue
+        if is_half:
+            minute = 30
+        elif minute_raw:
+            minute = _parse_cn_number(minute_raw)
+            if minute is None:
+                minute = 0
+        else:
+            minute = 0
+        day_offset = 0
+        if "\u660e\u5929" in modifier:
+            day_offset = 1
+        elif "\u540e\u5929" in modifier:
+            day_offset = 2
+        if "\u4e0b\u5348" in modifier or "\u665a\u4e0a" in modifier or "\u4eca\u665a" in modifier:
+            if hour <= 12:
+                hour += 12
+        results.append({
+            "raw": m.group(0), "hour": hour, "minute": minute,
+            "day_offset": day_offset, "is_completion": False,
+            "is_plan": False, "is_ambiguous": False,
+        })
+
+    # Pattern 2: bare time
+    bare_pat = re.compile(
+        r'(?<![\u4e0a\u4e0b\u4e2d\u665a\u4eca\u660e\u540e])(\d{1,2}|[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u4e24\u5eff\u5345]+)'
+        r'(?:\u70b9\u534a|\u534a\u70b9|\u70b9(\d{1,2}|[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u4e24]+)(?:\u5206)?|\u70b9)'
+        r'(?!\d)',
+    )
+    # Track explicit match spans for dedup
+    _explicit_spans = []
+    for r in results:
+        idx = clean.find(r["raw"])
+        if idx >= 0:
+            _explicit_spans.append((idx, idx + len(r["raw"])))
+
+    for m in bare_pat.finditer(clean):
+        already = any(r["raw"] == m.group(0) for r in results)
+        if not already:
+            # Check span overlap with explicit matches
+            bs, be = m.start(), m.end()
+            if any(es <= be and ee >= bs for es, ee in _explicit_spans):
+                already = True
+        if already:
+            continue
+        hour_raw = m.group(1)
+        minute_raw = m.group(2)
+        is_half = "\u534a" in m.group(0)
+        hour = _parse_cn_number(hour_raw)
+        if hour is None or hour > 24:
+            continue
+        if is_half:
+            minute = 30
+        elif minute_raw:
+            minute = _parse_cn_number(minute_raw)
+            if minute is None:
+                minute = 0
+        else:
+            minute = 0
+        span_start = max(0, m.start() - 10)
+        span_end = min(len(clean), m.end() + 10)
+        nearby = clean[span_start:span_end]
+        is_completion = any(w in nearby for w in _CN_COMPLETION_WORDS)
+        is_plan = any(w in nearby for w in _CN_PLAN_WORDS)
+        results.append({
+            "raw": m.group(0), "hour": hour, "minute": minute,
+            "day_offset": 0, "is_completion": is_completion,
+            "is_plan": is_plan, "is_ambiguous": False,
+        })
+
+    # Pattern 3: relative time
+    for m in re.finditer(r'(\u534a(?:\u4e2a)?(?:\u5c0f\u65f6|\u949f\u5934)(?:\u540e|\u4ee5\u540e|\u4e4b\u540e)?|\d+\u5206\u949f(?:\u540e|\u4ee5\u540e|\u4e4b\u540e)?)', clean):
+        raw = m.group(0)
+        delta = None
+        if "\u534a" in raw and ("\u5c0f\u65f6" in raw or "\u949f\u5934" in raw):
+            delta = timedelta(minutes=30)
+        elif "\u5206\u949f" in raw:
+            num_str = raw.rstrip("\u5206\u949f\u540e\u4ee5\u4e4b")
+            try:
+                num = int(num_str)
+            except ValueError:
+                continue
+            delta = timedelta(minutes=num)
+        if delta is not None:
+            results.append({
+                "raw": raw, "hour": None, "minute": None,
+                "day_offset": 0, "delta_minutes": delta.total_seconds() / 60,
+                "is_completion": False, "is_plan": True,
+                "is_ambiguous": False, "is_relative": True,
+            })
+
+    return results[:5]
+
+
+def _format_delta_zh(total_minutes):
+    abs_min = abs(total_minutes)
+    if abs_min < 1:
+        return "\u4e0d\u52301\u5206\u949f"
+    if abs_min < 60:
+        return f"{int(abs_min)}\u5206\u949f"
+    h = int(abs_min // 60)
+    m = int(abs_min % 60)
+    if m:
+        return f"{h}\u5c0f\u65f6{m}\u5206\u949f"
+    return f"{h}\u5c0f\u65f6"
+
+
+def _resolve_time_verdicts(expressions, now_cst):
+    from datetime import datetime, timedelta, timezone
+
+    lines = []
+    for expr in expressions:
+        raw = expr["raw"]
+        if expr.get("is_relative"):
+            delta_min = expr.get("delta_minutes", 0)
+            target = now_cst + timedelta(minutes=delta_min)
+            target_str = target.strftime("%H:%M")
+            delta_str = _format_delta_zh(-delta_min)
+            lines.append(f'\u7528\u6237\u63d0\u5230\u4e86"{raw}" \u2192 \u7406\u89e3\u4e3a{target_str}\uff08\u4e2d\u56fd\u65f6\u95f4\uff09\u3002')
+            lines.append(f'\u5f53\u524d{now_cst.strftime("%H:%M")}\uff0c\u8fd8\u6709\u7ea6{delta_str}\u3002')
+            lines.append('\u2192 \u8fd9\u662f\u4e00\u4e2a\u672a\u6765\u65f6\u95f4\uff0c\u4e0d\u8981\u628a\u5b83\u8bf4\u6210\u5df2\u7ecf\u53d1\u751f\u3002')
+            continue
+
+        hour = expr["hour"]
+        minute = expr["minute"]
+        day_offset = expr.get("day_offset", 0)
+        is_completion = expr.get("is_completion", False)
+        is_plan = expr.get("is_plan", False)
+        if hour is None or minute is None:
+            continue
+
+        now_hour = now_cst.hour
+        adjusted_hour = hour
+        if not any(m in raw for m in ("\u65e9\u4e0a", "\u4e0a\u5348", "\u4e2d\u5348", "\u4e0b\u5348", "\u665a\u4e0a", "\u4eca\u665a", "\u660e\u5929", "\u540e\u5929")):
+            if 18 <= now_hour <= 23 and hour <= 12:
+                adjusted_hour = hour + 12 if hour != 12 else hour
+            elif 12 <= now_hour <= 17 and hour <= 6:
+                adjusted_hour = hour + 12
+            elif 0 <= now_hour <= 4 and hour <= 12:
+                if is_completion:
+                    # Midnight + completion: likely last night
+                    adjusted_hour = hour + 12 if hour != 12 else hour
+                # else: morning — stay as-is
+
+        cst = timezone(timedelta(hours=8))
+        target = now_cst.replace(hour=adjusted_hour, minute=minute, second=0, microsecond=0)
+        if day_offset > 0:
+            target = target + timedelta(days=day_offset)
+        diff_min = (now_cst - target).total_seconds() / 60
+        now_str = now_cst.strftime("%H:%M")
+
+        if is_completion:
+            if diff_min < 0:
+                lines.append(f'\u7528\u6237\u63d0\u5230\u4e86"{raw}"\uff08\u5b8c\u6210\u6001/\u8fc7\u53bb\u6001\uff09 \u2192 \u7406\u89e3\u4e3a{target.strftime("%H:%M")}\uff08\u4e2d\u56fd\u65f6\u95f4\uff09\u3002')
+                lines.append(f'\u5f53\u524d{now_str}\uff0c\u6309\u7528\u6237\u610f\u56fe\u8be5\u65f6\u523b\u5df2\u5230\uff0c\u4e0d\u8981\u8ffd\u95ee\u662f\u5426\u5230\u4e86\u3002')
+            else:
+                delta_str = _format_delta_zh(diff_min)
+                lines.append(f'\u7528\u6237\u63d0\u5230\u4e86"{raw}"\uff08\u5b8c\u6210\u6001/\u8fc7\u53bb\u6001\uff09 \u2192 \u7406\u89e3\u4e3a{target.strftime("%H:%M")}\uff08\u4e2d\u56fd\u65f6\u95f4\uff09\u3002')
+                lines.append(f'\u5f53\u524d{now_str}\uff0c\u8be5\u65f6\u523b\u5df2\u7ecf\u8fc7\u53bb\u7ea6{delta_str}\u3002')
+                lines.append(f'\u2192 \u4e0d\u8981\u8bf4\u201c\u8fd8\u6709X\u5206\u949f\u5230{raw}\u201d\uff0c{raw}\u5df2\u8fc7\u3002')
+        elif is_plan:
+            if diff_min > 0 and diff_min < 120:
+                lines.append(f'\u7528\u6237\u63d0\u5230\u4e86"{raw}"\uff08\u8ba1\u5212\u6001\uff09 \u2192 \u7406\u89e3\u4e3a{target.strftime("%H:%M")}\uff08\u4e2d\u56fd\u65f6\u95f4\uff09\u3002')
+                lines.append(f'\u5f53\u524d{now_str}\uff0c\u8be5\u65f6\u523b\u521a\u8fc7\u4e0d\u4e45\uff0c\u4f46\u7528\u6237\u8bed\u5e26\u8ba1\u5212\u3002')
+                lines.append('\u2192 \u4e0d\u8981\u5f53\u4f5c\u5df2\u7ecf\u53d1\u751f\u7684\u4e8b\u60c5\u3002')
+            elif diff_min < 0:
+                delta_str = _format_delta_zh(-diff_min)
+                lines.append(f'\u7528\u6237\u63d0\u5230\u4e86"{raw}"\uff08\u8ba1\u5212\u6001\uff09 \u2192 \u7406\u89e3\u4e3a{target.strftime("%H:%M")}\uff08\u4e2d\u56fd\u65f6\u95f4\uff09\u3002')
+                lines.append(f'\u5f53\u524d{now_str}\uff0c\u8fd8\u6709\u7ea6{delta_str}\u3002')
+            else:
+                tomorrow = target + timedelta(days=1)
+                diff_tomorrow = (now_cst - tomorrow).total_seconds() / 60
+                delta_str = _format_delta_zh(-diff_tomorrow)
+                lines.append(f'\u7528\u6237\u63d0\u5230\u4e86"{raw}"\uff08\u8ba1\u5212\u6001\uff09 \u2192 \u7406\u89e3\u4e3a\u660e\u5929{tomorrow.strftime("%H:%M")}\uff08\u4e2d\u56fd\u65f6\u95f4\uff09\u3002')
+                lines.append(f'\u5f53\u524d{now_str}\uff0c\u4eca\u5929\u8be5\u65f6\u523b\u5df2\u8fc7\uff0c\u7406\u89e3\u4e3a\u660e\u5929\uff0c\u8fd8\u6709\u7ea6{delta_str}\u3002')
+        else:
+            if diff_min > 5:
+                delta_str = _format_delta_zh(diff_min)
+                lines.append(f'\u7528\u6237\u63d0\u5230\u4e86"{raw}" \u2192 \u7406\u89e3\u4e3a{target.strftime("%H:%M")}\uff08\u4e2d\u56fd\u65f6\u95f4\uff09\u3002')
+                lines.append(f'\u5f53\u524d{now_str}\uff0c\u8be5\u65f6\u523b\u5df2\u7ecf\u8fc7\u53bb\u7ea6{delta_str}\u3002')
+                lines.append(f'\u2192 \u4e0d\u8981\u8bf4\u201c\u8fd8\u6709X\u5206\u949f\u5230{raw}\u201d\uff0c{raw}\u5df2\u8fc7\u3002')
+            elif diff_min >= -5 and diff_min <= 5:
+                lines.append(f'\u7528\u6237\u63d0\u5230\u4e86"{raw}" \u2192 \u7406\u89e3\u4e3a{target.strftime("%H:%M")}\uff08\u4e2d\u56fd\u65f6\u95f4\uff09\u3002')
+                lines.append(f'\u5f53\u524d{now_str}\uff0c\u5dee\u4e0d\u591a\u5c31\u662f\u73b0\u5728\u3002')
+            else:
+                delta_str = _format_delta_zh(-diff_min)
+                lines.append(f'\u7528\u6237\u63d0\u5230\u4e86"{raw}" \u2192 \u7406\u89e3\u4e3a{target.strftime("%H:%M")}\uff08\u4e2d\u56fd\u65f6\u95f4\uff09\u3002')
+                lines.append(f'\u5f53\u524d{now_str}\uff0c\u8fd8\u6709\u7ea6{delta_str}\u3002')
+
+    if not lines:
+        return ""
+    return "[time_verdict]\n" + "\n".join(lines) + "\n[/time_verdict]"
+
+
+def _build_time_verdict(user_text, now_cst):
+    try:
+        expressions = _detect_chinese_time_expressions(user_text)
+        if not expressions:
+            return ""
+        return _resolve_time_verdicts(expressions, now_cst)
+    except Exception:
+        return ""
+
+def _peek_heartbeat_event_sync(token: str) -> "dict | None":
+    """Blocking GET /api/heartbeat/event/peek?session_id=default.
+
+    Always called via asyncio.to_thread(...) from the async layer; never
+    called directly from the event loop. Fail-open: returns None on any
+    error. Never logs the plaintext token.
+    """
+    try:
+        import urllib.request
+        import urllib.error
+        import json as _json
+        if not token:
+            return None
+        _url = "https://isles-story.site/api/heartbeat/event/peek?session_id=default"
+        _req = urllib.request.Request(
+            _url,
+            headers={"Authorization": f"Bearer {token}", "User-Agent": "HermesGateway/4.2.8", "Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(_req, timeout=1) as _resp:
+            if _resp.status != 200:
+                return None
+            _raw = _resp.read()
+            if not _raw:
+                return None
+            _data = _json.loads(_raw)
+            if isinstance(_data, dict) and _data.get("event"):
+                _ev = _data.get("event")
+                if isinstance(_ev, dict):
+                    return _ev
+            if isinstance(_data, dict) and _data.get("event_id"):
+                return _data
+            return None
+    except Exception:
+        return None
+
+
+def _format_heartbeat_prompt(event: dict) -> str:
+    """Format a heartbeat event into a private-room narrative injection.
+
+    v4.2.8 Phase 2.2-c: Interpret heartbeat_interaction_event as private_room
+    context by DEFAULT. This is a TEMPORARY strategy for v4.2.8 — not a
+    permanent protocol definition. When future daily-interaction UI/events
+    are introduced, scene_mode field or event-type branching will be needed.
+    Currently no frontend/Worker changes, so scene_mode is NOT added yet.
+
+    Boundary priority (hard logic):
+      1. intent in {stop, slow_down}  → boundary structure (A > B)
+      2. response_expectation stop/slow_down → demote to boundary semantics
+      3. stop > slow_down always
+    """
+    try:
+        if not isinstance(event, dict):
+            return ""
+
+        _intent = str(event.get("intent") or "touch").strip().lower()
+        _intensity = event.get("intensity")
+        _expect = str(event.get("response_expectation") or "warm_acknowledge").strip().lower()
+
+        # ── intent → verb mapping ──
+        _intent_verbs = {
+            "touch": "碰了碰",
+            "caress": "抚摸了",
+            "kiss": "亲了",
+            "hug": "抱住了",
+            "pull_close": "拉到身边",
+        }
+        # ── intensity → modifier + elaboration ──
+        _intensity_map = {
+            "low": ("轻轻", "试探性的、小心翼翼的——"),
+            "mid": ("", "主动的、带着明确意图的——"),
+            "high": ("急切地", "迫不及待的、带着渴望的——"),
+        }
+        # ── expectation → guide ──
+        _expect_guides = {
+            "warm_acknowledge": "温柔地回应她的动作",
+            "continue_narrative": "顺着这个互动继续下去",
+            "slow_down": "但注意她的节奏——她需要慢下来，请放轻放慢",
+            "stop": "但她需要暂停，请温柔地停下来陪着她",
+        }
+
+        def _band(v):
+            if v is None:
+                return "mid"
+            v = float(v)
+            if v < 0.3:
+                return "low"
+            if v <= 0.7:
+                return "mid"
+            return "high"
+
+        # ── boundary priority: stop > slow_down ──
+        is_boundary_intent = _intent in {"stop", "slow_down"}
+        is_boundary_expect = _expect in {"stop", "slow_down"}
+
+        if is_boundary_intent or is_boundary_expect:
+            # stop always wins over slow_down
+            if _intent == "stop" or _expect == "stop":
+                _boundary_verb = "停下来"
+            else:
+                _boundary_verb = "节奏慢下来"
+            return (
+                "【本轮必须遵守的刚刚发生的边界信号】\n"
+                f"小岛拓刚刚在小房间里表示她需要{_boundary_verb}。"
+                "这是当前互动的最高优先级。"
+                "你回复她时，必须先尊重这个信号，再温柔地回应她。"
+                "不要继续推进，不要绕过她的边界。"
+            )
+
+        # ── structure A: touch / caress / kiss / hug / pull_close ──
+        _verb = _intent_verbs.get(_intent, "碰了碰")
+        _band_key = _band(_intensity)
+        _adj, _elab = _intensity_map[_band_key]
+        _guide = _expect_guides.get(_expect, "温柔地回应她的动作")
+
+        return (
+            "【本轮必须承接的刚刚发生的互动】\n"
+            f"小岛拓刚刚在小房间里{_adj}{_verb}你。"
+            "这个动作发生在她这次发来消息之前，是当前对话的直接前文。"
+            "你回复她时，必须先接住这个动作，再自然回应她现在说的话。"
+            "不要复述这段说明，不要说\"我收到事件\"，也不要把它当成背景气氛。"
+        )
+    except Exception:
+        return ""
+
+# End v4.2.8 Phase 2.2-a heartbeat helpers (read-only probe)
 
 
 def _format_gateway_process_notification(evt: dict) -> "str | None":
@@ -3911,6 +4529,227 @@ class GatewayRunner:
 
         return message_text
 
+
+    def _is_engineering_noise(self, sentence):
+        """Check if a reasoning sentence is engineering/system noise — hard exclude.
+
+        Returns True if the sentence should be completely excluded from output.
+        """
+        if not sentence:
+            return True
+        _sl = sentence.lower()
+
+        ENGINEERING_PATTERNS = [
+            # System / prompt / model internals
+            "system prompt", "system", "prompt",
+            # Tool calls
+            "tool call", "tool",
+            # Secrets / tokens
+            "token", "secret", "api key",
+            # API / network
+            "API", "endpoint", "request", "response",
+            "webhook", "callback",
+            # Data formats
+            "JSON", "schema",
+            # Config
+            "config", "model config",
+            # Debug internals
+            "reasoning_content", "raw reasoning", "chain-of-thought",
+            # Search / brain
+            "search", "brain library", "脑库", "检索",
+            # Session
+            "session", "compaction", "压缩",
+            # Code / URLs
+            "http://", "https://", "def ", "class ", "import ",
+            "function(", "=>", "```",
+            # Debug logging
+            "test", "ignore", "检查配置",
+            "Let me search", "Let me check", "I need to check",
+            "look up", "retrieve",
+        ]
+        for _p in ENGINEERING_PATTERNS:
+            if _p.lower() in _sl:
+                return True
+        return False
+
+    def _soft_penalty_reasoning_sentence(self, sentence):
+        """Apply soft penalty to low-value reasoning patterns.
+
+        Returns a float (negative or zero). Used ONLY for sort ordering
+        among non-excluded sentences — NOT as a hard gate.
+
+        Penalties:
+        - `综上所述` / `根据以上` / `我将分析`  → -0.3 (formulaic fillers)
+        - `第一阶段` / `第二步` → -0.2 (structuring markers)
+        - `准备回复` → -0.2 (response prep with no inner content)
+        """
+        if not sentence:
+            return 0.0
+        _sl = sentence.lower()
+        _penalty = 0.0
+
+        _low_value = [
+            "综上所述", "根据以上", "我将分析",
+            "第一阶段", "第二阶段", "第一步", "第二步",
+            "第三步", "第四步",
+        ]
+        for _w in _low_value:
+            if _w in _sl:
+                _penalty -= 0.3
+                break
+
+        if "准备回复" in _sl:
+            _penalty -= 0.2
+
+        return _penalty
+
+    def _is_near_duplicate_of_reply(self, sentence, final_response):
+        """Three-stage conservative check for repetition of final reply.
+
+        Stage 1 — substring containment (after punctuation removal):
+          如果 sentence 去标点后是 reply 连续子串 → True
+          如果 reply 去标点后是 sentence 连续子串 → True
+
+        Stage 2 — short sentence bigram check:
+          如果 sentence < 40 chars 且 bigram overlap > 80% → True
+
+        Stage 3 — default:
+          否则 → False (no overlap)
+        """
+        if not final_response or not sentence:
+            return False
+        if len(sentence) < 8 or len(final_response) < 8:
+            return False
+
+        import re as _re
+
+        def _strip_punct(text):
+            return _re.sub(r'[^\w\s]', '', text.lower().strip())
+
+        _ss = _strip_punct(sentence)
+        _rs = _strip_punct(final_response)
+
+        if not _ss or not _rs:
+            return False
+
+        # Stage 1: substring containment
+        if _ss in _rs or _rs in _ss:
+            return True
+
+        # Stage 2: short sentence bigram overlap > 80%
+        if len(sentence) < 40:
+            _sent_words = _ss.split()
+            _reply_words = _rs.split()
+            if len(_sent_words) < 2 or len(_reply_words) < 2:
+                # Need at least 2 words for a bigram
+                return len([w for w in _sent_words if w in _reply_words]) / len(_sent_words) > 0.80
+            _sent_bigrams = set(' '.join(_sent_words[i:i+2]) for i in range(len(_sent_words)-1))
+            _reply_bigrams = set(' '.join(_reply_words[i:i+2]) for i in range(len(_reply_words)-1))
+            if not _sent_bigrams:
+                return False
+            _overlap = len(_sent_bigrams & _reply_bigrams)
+            return _overlap / len(_sent_bigrams) > 0.80
+
+        # Stage 3: default — no overlap detected
+        return False
+
+    def _extract_visible_inner_note(self, last_reasoning, final_response=None):
+        """4d.6e-3E-r4 (wide preview): Broad engineering-noise filter only.
+
+        Preview strategy — let the user see what reasoning looks like
+        after removing engineering/system noise, without over-filtering.
+
+        Strategy:
+        1. Split reasoning into sentences
+        2. Hard-exclude engineering/system sentences via _is_engineering_noise()
+        3. Soft-penalize low-value patterns for sort ordering (not a gate)
+        4. Filter near-duplicates of final reply (conservative three-stage check)
+        5. Take up to 3-8 sentences, target 200-500 chars, hard cap 600 chars
+
+        Explicitly NOT filtered:
+        - 用户 / 分析 / 她说 / 她问 / 我应该 / 我需要
+        - first-person expressions, emotional content
+        - meta-cognitive markers
+
+        Returns dict with keys for visible_inner_note, or None.
+        """
+        if not last_reasoning or not isinstance(last_reasoning, str):
+            return None
+        if len(last_reasoning.strip()) < 6:
+            return None
+
+        import re as _re
+        from datetime import datetime, timezone
+
+        _raw = _re.split(r'[。！？\n；;.?!]+', last_reasoning.strip())
+        _candidates = []
+        for _i, _s in enumerate(_raw):
+            _s = _s.strip()
+            if len(_s) < 4:
+                continue
+            # Hard exclude: engineering noise
+            if self._is_engineering_noise(_s):
+                continue
+            # Soft penalty for low-value patterns
+            _penalty = self._soft_penalty_reasoning_sentence(_s)
+            # Near-duplicate filter
+            if final_response and self._is_near_duplicate_of_reply(_s, final_response):
+                continue
+            _candidates.append((_i, _s, _penalty))
+
+        if not _candidates:
+            return None
+
+        # Sort: lower penalty (less negative) first, then original order
+        _candidates.sort(key=lambda x: (x[2], x[0]))
+
+        # Take 3-8 sentences up to 600 chars
+        _selected = []
+        _running = 0
+        MAX_LEN = 600
+        for _i, _s, _penalty in _candidates:
+            _cand = _s.strip() + '。'
+            if _running + len(_cand) <= MAX_LEN:
+                _selected.append(_cand)
+                _running += len(_cand)
+            elif _running == 0:
+                _selected.append(_cand[:MAX_LEN].rstrip())
+                break
+            else:
+                break
+
+        _clean = ''.join(_selected).strip()
+
+        # Min length guard — prevent single-word debris
+        if not _clean or len(_clean) < 6:
+            return None
+
+        return {
+            "text": _clean,
+            "mode": "inner_note",
+            "source": "model_reasoning_inner_note",
+            "generated_at": datetime.now(timezone.utc).isoformat()
+        }
+    
+    def _inner_note_has_forbidden(self, text):
+        """4d.3: Check if inner_note contains forbidden keywords (aligned with 4c.2c).
+
+        Final safety gate — prevents system/internal keywords from leaking
+        into frontend-visible output. NOTE: '用户' and '分析' are deliberately
+        excluded here — they're too common in natural inner notes and are
+        already filtered at the EXCLUDE level in _extract_visible_inner_note.
+        """
+        if not text:
+            return True
+        FORBIDDEN = [
+            "系统", "对方", "推理",
+            "思考链", "chain-of-thought", "reasoning",
+            "system prompt", "tool call", "token",
+            "API", "webhook", "callback", "prompt",
+        ]
+        _t = text.lower()
+        return any(kw.lower() in _t for kw in FORBIDDEN)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -4368,6 +5207,56 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        # r4.4: ephemeral turn modality context — injected into context_prompt
+        # Reads meta.turn_segments from raw_message to understand ordered input modalities.
+        # Only injects structural info (count, type order), never user content/transcripts.
+        # Must be isles-story webhook route — not other webhooks, not Telegram/CLI/etc.
+        _rm = getattr(event, "raw_message", None)
+        _message = _rm.get("message") if isinstance(_rm, dict) else None
+        if (
+            isinstance(_message, dict)
+            and (getattr(source.platform, "value", None) == "webhook")
+            and (":isles-story:" in (source.chat_id or ""))
+        ):
+            _turn_segments = (_message.get("meta") or {}).get("turn_segments")
+            if isinstance(_turn_segments, list) and _turn_segments:
+                _type_order = []
+                _voice_count = 0
+                _image_count = 0
+                _text_count = 0
+                for _ts in _turn_segments:
+                    _t = _ts.get("type") if isinstance(_ts, dict) else None
+                    if _t:
+                        _type_order.append(str(_t))
+                        if _t == "voice":
+                            _voice_count += 1
+                        elif _t == "image":
+                            _image_count += 1
+                        elif _t == "text":
+                            _text_count += 1
+                _modality_summary = (
+                    "User submitted one turn with "
+                    + str(len(_turn_segments))
+                    + " ordered input segment(s): "
+                    + ", ".join(_type_order)
+                    + ". "
+                )
+                if _voice_count > 0:
+                    _modality_summary += (
+                        str(_voice_count) + " voice segment(s). "
+                    )
+                if _image_count > 0:
+                    _modality_summary += (
+                        str(_image_count) + " image segment(s). "
+                    )
+                context_prompt = _modality_summary + context_prompt
+            elif isinstance(_message, dict) and _message.get("type") == "voice":
+                # r4.3 compat: single voice without turn_segments
+                context_prompt = (
+                    "Voice message received. "
+                    + context_prompt
+                )
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -4667,8 +5556,38 @@ class GatewayRunner:
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+
+            # ── v4.2.19: isles-story voice bridge ──
+            _isles = (
+                event.source.platform == Platform.WEBHOOK
+                and self.is_isles_story_source(event.source)
+            )
+            # ── v4.2.19-phase2b: voice intent boundary ──
+            # Bridge EXISTING audio only — never auto-generate TTS.
+            # Trigger: agent already produced a MEDIA:<path> tag (桔小鸟主动发语音)
+            _has_existing_audio = "MEDIA:" in (response or "")
+            if _isles and response and _has_existing_audio:
+                logger.info("[isles-voice] existing audio detected in response")
+                voice_meta = await self._isles_voice_bridge_sync(response)
+                webhook = self.adapters.get(event.source.platform)
+                if webhook and hasattr(webhook, 'set_pending_voice_meta'):
+                    webhook.set_pending_voice_meta(voice_meta)
+                if voice_meta:
+                    logger.info("[isles-voice] bridged audio_key=%s",
+                                voice_meta.get('voice', {}).get('audio_key', '?'))
+                    # ── v4.2.19-phase2c-B0: strip MEDIA from response ──
+                    # Voice bridge consumed the audio; remove MEDIA tags so
+                    # they never leak as plain text in any fallback path.
+                    import re as _re_strip
+                    response = _re_strip.sub(r'\[\[audio_as_voice\]\]\s*', '', response or '')
+                    response = _re_strip.sub(r'MEDIA:\S+', '', response).strip()
+                    if not response and voice_meta:
+                        response = "[voice]"
+                else:
+                    logger.info("[isles-voice] bridge upload failed, staying text-only")
+            elif self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
+            # ── end isles-story voice bridge ──
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -4689,6 +5608,34 @@ class GatewayRunner:
                             response, event, _media_adapter,
                         )
                 return None
+
+            # === 4d.3: Extract & cache visible_inner_note (concurrency-safe) ===
+            _inner = None
+            try:
+                _inner = self._extract_visible_inner_note(
+                    agent_result.get("last_reasoning"),
+                    final_response=response,
+                )
+            except Exception:
+                _inner = None  # fail-open
+
+            if _inner is not None:
+                try:
+                    _webhook = self.adapters.get(source.platform)
+                    if _webhook and hasattr(_webhook, '_inner_note_cache'):
+                        _msg_id = getattr(event, 'message_id', '') or ''
+                        if _msg_id:  # HARD GUARD: no per-message differentiator -> skip
+                            _content_hash = hashlib.sha256(
+                                (response or '').encode()
+                            ).hexdigest()[:16]
+                            _cache_key = f"{source.chat_id}:{_msg_id}:{_content_hash}"
+                            _webhook._inner_note_cache[_cache_key] = {
+                                "visible_inner_note": _inner
+                            }
+                            _webhook._inner_note_cache_ts[_cache_key] = time.time()
+                except Exception:
+                    pass  # fail-open
+            # === end 4d.3 ===
 
             return response
             
@@ -5870,6 +6817,7 @@ class GatewayRunner:
             return f"Failed to save home channel: {e}"
         
         return (
+            "【本轮必须承接的刚刚发生的互动】\n"
             f"✅ Home channel set to **{chat_name}** (ID: {chat_id}).\n"
             f"Cron jobs and cross-platform messages will be delivered here."
         )
@@ -6220,6 +7168,199 @@ class GatewayRunner:
                 except OSError:
                     pass
 
+    # ── v4.2.19: isles-story voice bridge ──
+
+    @staticmethod
+    def is_isles_story_source(source) -> bool:
+        """Detect isles-story webhook events from SessionSource fields."""
+        if getattr(source, 'route', '') == 'isles-story':
+            return True
+        if getattr(source, 'user_name', '') == 'isles-story':
+            return True
+        if getattr(source, 'user_id', '') == 'webhook:isles-story':
+            return True
+        return False
+
+    async def _isles_voice_bridge_sync(self, text: str) -> Optional[dict]:
+        """Bridge existing audio (MEDIA: tag) to isles-story Worker.
+
+        Only called when response already contains MEDIA:<path> — the agent
+        (桔小鸟) already generated TTS audio via text_to_speech_tool.
+        This function does NOT generate new TTS.  It extracts the existing
+        audio file path and uploads it directly to the Worker.
+
+        v4.2.19-phase4b: reads .spoken.txt sidecar before upload, deletes
+        in finally (fail-open). Non-empty spoken_text → meta.spoken_text
+        + meta.transcript (source: tts_input).
+
+        Returns:
+            {voice: {audio_key, mime, duration_ms, size
+                     [, spoken_text, transcript]}}
+            on success; None on any failure.
+        """
+        import os as _os
+        import re as _re
+
+        # ── Extract existing audio file path ──
+        _media_match = _re.search(r'MEDIA:(\S+)', text)
+        if not _media_match:
+            logger.warning("[isles-voice] no MEDIA path found (unexpected)")
+            return None
+
+        _existing_path = _media_match.group(1).rstrip('",})\'')
+        if not _os.path.isfile(_existing_path):
+            logger.warning("[isles-voice] audio file not found: %s", _existing_path)
+            return None
+
+        # ── v4.2.19-phase4b: read spoken_text sidecar before upload ──
+        _spoken_path = _existing_path + ".spoken.txt"
+        _raw_text = ""
+        try:
+            with open(_spoken_path, "r") as _sf:
+                _raw_text = _sf.read()
+        except Exception as _sr_err:
+            pass  # fail-open: sidecar missing is OK
+
+        # ── Upload existing audio directly (skip TTS) ──
+        try:
+            upload_result = await self._isles_voice_upload(_existing_path)
+            _voice_meta = {
+                "voice": {
+                    "audio_key": upload_result["key"],
+                    "mime": upload_result["mime"],
+                    "duration_ms": self._estimate_audio_duration(_existing_path),
+                    "size": upload_result["size"],
+                },
+            }
+
+            # ── Only add spoken_text/transcript if non-empty ──
+            if _raw_text.strip():
+                _voice_meta["spoken_text"] = _raw_text
+                _voice_meta["transcript"] = {
+                    "status": "ready",
+                    "text": _raw_text,
+                    "source": "tts_input",
+                }
+
+            return _voice_meta
+        except Exception as e:
+            logger.warning("[isles-voice] upload failed: %s", e)
+            return None
+        finally:
+            # ── Best-effort delete sidecar (upload fail / read fail → delete) ──
+            try:
+                if _os.path.isfile(_spoken_path):
+                    _os.remove(_spoken_path)
+            except Exception as _sd_err:
+                logger.warning(
+                    "[isles-voice] sidecar delete failed: %s",
+                    type(_sd_err).__name__
+                )
+
+
+    async def _isles_tts_generate(self, text: str) -> str:
+        """Generate TTS audio file with 15s timeout.
+
+        Wraps text_to_speech_tool() — does NOT read or pass MiniMax API key.
+        Returns absolute path to generated audio file.
+        """
+        import os as _os2
+        import uuid as _uuid2
+        import json as _json
+
+        from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
+
+        tts_text = _strip_markdown_for_tts(text[:4000])
+        if not tts_text:
+            raise ValueError("TTS text is empty after stripping markdown")
+
+        audio_path = _os2.path.join(
+            tempfile.gettempdir(), "hermes_voice",
+            f"isles_tts_{_uuid2.uuid4().hex[:12]}.mp3",
+        )
+        _os2.makedirs(_os2.path.dirname(audio_path), exist_ok=True)
+
+        result_json = await asyncio.wait_for(
+            asyncio.to_thread(text_to_speech_tool, text=tts_text, output_path=audio_path),
+            timeout=TTS_TIMEOUT,
+        )
+        result = _json.loads(result_json)
+
+        actual_path = result.get("file_path", audio_path)
+        if not result.get("success") or not _os2.path.isfile(actual_path):
+            raise RuntimeError(f"TTS failed: {result.get('error', 'unknown error')}")
+
+        return actual_path
+
+    async def _isles_voice_upload(self, audio_path: str) -> dict:
+        """Upload audio file to isles-story Worker with 10s timeout.
+
+        Returns {key, mime, size} from Worker response.
+        """
+        import aiohttp
+        import os as _os3
+
+        # Get token and base URL from webhook adapter
+        adapter = self.adapters.get(Platform.WEBHOOK)
+        if not adapter:
+            raise RuntimeError("Webhook adapter not found")
+
+        chat_id = "webhook:isles-story:main"
+        delivery = adapter._delivery_info.get(chat_id, {})
+        token = delivery.get("deliver_extra", {}).get("token", "")
+        callback_url = delivery.get("deliver_extra", {}).get("url", "")
+
+        if not token or not callback_url:
+            raise RuntimeError("No isles-story token/URL in webhook delivery info")
+
+        # Derive upload URL from callback URL
+        base_url = callback_url.rsplit("/api/chat/callback", 1)[0]
+        upload_url = f"{base_url}/api/media/voice/upload"
+
+        # Determine MIME
+        if audio_path.endswith(".ogg"):
+            mime = "audio/ogg"
+        elif audio_path.endswith(".wav"):
+            mime = "audio/wav"
+        else:
+            mime = "audio/mpeg"
+
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                upload_url,
+                data=audio_data,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": mime,
+                },
+                timeout=aiohttp.ClientTimeout(total=UPLOAD_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Upload failed: HTTP {resp.status}")
+                result = await resp.json()
+                if not result.get("ok"):
+                    raise RuntimeError(f"Upload error: {result}")
+                return result
+
+    @staticmethod
+    def _estimate_audio_duration(audio_path: str) -> int:
+        """Estimate audio duration in milliseconds from file size.
+
+        Fallback: 3000ms default if file cannot be read.
+        """
+        import os as _os4
+        try:
+            size = _os4.path.getsize(audio_path)
+            # Rough estimate: 128kbps MP3 = ~16KB/s
+            return max(500, int(size / 16))
+        except OSError:
+            return 3000
+
+    # ── end isles-story voice bridge ──
+
     async def _deliver_media_from_response(
         self,
         response: str,
@@ -6234,8 +7375,19 @@ class GatewayRunner:
         """
         from pathlib import Path
 
+        logger.info("[%s] _deliver_media_from_response: response has MEDIA tag", adapter.name)
+
         try:
             media_files, _ = adapter.extract_media(response)
+            logger.info(
+                "[%s] extract_media found %d media files",
+                adapter.name, len(media_files),
+            )
+            for mpath, is_voice in media_files:
+                logger.info(
+                    "[%s]   media: path=%s is_voice=%s",
+                    adapter.name, mpath, is_voice,
+                )
             _, cleaned = adapter.extract_images(response)
             local_files, _ = adapter.extract_local_files(cleaned)
 
@@ -7223,6 +8375,7 @@ class GatewayRunner:
 
         msg_count = len([m for m in history if m.get("role") == "user"])
         return (
+            "【本轮必须承接的刚刚发生的互动】\n"
             f"⑂ Branched to **{branch_title}**"
             f" ({msg_count} message{'s' if msg_count != 1 else ''} copied)\n"
             f"Original: `{parent_session_id}`\n"
@@ -9457,6 +10610,49 @@ class GatewayRunner:
             except Exception as _e:
                 logger.debug("status_callback error (%s): %s", event_type, _e)
 
+        _hb_pending_block = ""
+        # ──────────────── v4.2.8 Phase 2.2-b heartbeat probe+inject ────────────
+        # Read-only peek; DEBUG log only; no injection into combined_ephemeral.
+        # Scope gate: isles-story webhook route only. Fail-open.
+        try:
+            if _is_heartbeat_eligible(source, session_key):
+                _hb_token = _get_heartbeat_token()
+                if _hb_token:
+                    _hb_event = await asyncio.to_thread(
+                        _peek_heartbeat_event_sync, _hb_token
+                    )
+                    if _hb_event:
+                        _hb_event_id = str(_hb_event.get("event_id") or "")
+                        _hb_last = _heartbeat_last_event_id.get(session_key)
+                        if _hb_event_id and _hb_event_id == _hb_last:
+                            logger.info(
+                                "heartbeat event seen (dup skip) event_id=%s",
+                                _hb_event_id,
+                            )
+                        elif _hb_event_id:
+                            logger.info(
+                                "heartbeat event seen event_id=%s",
+                                _hb_event_id,
+                            )
+                            _heartbeat_last_event_id[session_key] = _hb_event_id
+                            try:
+                                _hb_formatted = _format_heartbeat_prompt(_hb_event)
+                                if _hb_formatted:
+                                    _hb_pending_block = _hb_formatted
+                                    logger.info(
+                                        "heartbeat event injected event_id=%s len=%d",
+                                        _hb_event_id,
+                                        len(_hb_formatted),
+                                    )
+                            except Exception as _hb_fmt_exc:
+                                logger.debug(
+                                    "heartbeat format failed (fail-open): %s",
+                                    _hb_fmt_exc,
+                                )
+        except Exception as _hb_exc:
+            logger.debug("heartbeat probe failed (fail-open): %s", _hb_exc)
+        # ──────────────── End Phase 2.2-b heartbeat probe+inject ────────
+
         def run_sync():
             # The conditional re-assignment of `message` further below
             # (prepending model-switch notes) makes Python treat it as a
@@ -9485,6 +10681,19 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            # v4.2.10-time-awareness Phase 1: temporal context injection (ephemeral)
+            if TEMPORAL_AWARENESS_ENABLED:
+                try:
+                    temporal_prompt = _build_temporal_context(history, source, session_key, message)
+                except Exception:
+                    temporal_prompt = ""
+                if temporal_prompt:
+                    if combined_ephemeral:
+                        combined_ephemeral = (combined_ephemeral + "\n\n" + temporal_prompt).strip()
+                    else:
+                        combined_ephemeral = temporal_prompt
+            # v4.2.8 Phase 2.2-c4: heartbeat block moved from combined_ephemeral
+            # to user message prefix (see prepend below).
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
@@ -9938,11 +11147,16 @@ class GatewayRunner:
                     + message
                 )
 
+            # v4.2.8 Phase 2.2-c4: heartbeat block as user message prefix
+            # Save clean message (with legal prepends, without heartbeat) for persistence.
+            _message_before_hb = message
+            if _hb_pending_block:
+                message = _hb_pending_block + "\n\n" + message
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
-                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id, persist_user_message=_message_before_hb)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)

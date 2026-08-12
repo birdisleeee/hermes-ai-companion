@@ -7727,6 +7727,23 @@ Examples:
         action="store_true",
         help="Enable verbose logging on stderr",
     )
+    mcp_serve_p.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="Transport: stdio (local) or http (remote, default: stdio)",
+    )
+    mcp_serve_p.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port for HTTP transport (default: 8765)",
+    )
+    mcp_serve_p.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host for HTTP transport (default: 0.0.0.0)",
+    )
 
     mcp_add_p = mcp_sub.add_parser(
         "add", help="Add an MCP server (discovery-first install)"

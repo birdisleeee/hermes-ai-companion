@@ -6926,12 +6926,21 @@ class AIAgent:
         if provider_preferences and _is_openrouter:
             extra_body["provider"] = provider_preferences
         _is_nous = "nousresearch" in self._base_url_lower
+        _is_ark = "ark.cn-beijing.volces.com" in self._base_url_lower
+        _is_deepseek = "api.deepseek.com" in self._base_url_lower
 
         if self._supports_reasoning_extra_body():
             if _is_github_models:
                 github_reasoning = self._github_models_reasoning_extra_body()
                 if github_reasoning is not None:
                     extra_body["reasoning"] = github_reasoning
+
+            elif _is_ark:
+                extra_body["thinking"] = {"type": "enabled", "budget_tokens": 200}
+
+            elif _is_deepseek:
+                extra_body["thinking"] = {"type": "enabled"}
+
             else:
                 if self.reasoning_config is not None:
                     rc = dict(self.reasoning_config)
@@ -7003,6 +7012,12 @@ class AIAgent:
                 return bool(github_model_reasoning_efforts(self.model))
             except Exception:
                 return False
+        if "ark.cn-beijing.volces.com" in self._base_url_lower:
+            return True
+
+        if "api.deepseek.com" in self._base_url_lower:
+            return True
+
         if "openrouter" not in self._base_url_lower:
             return False
         if "api.mistral.ai" in self._base_url_lower:
@@ -7273,10 +7288,6 @@ class AIAgent:
             api_messages = []
             for msg in messages:
                 api_msg = msg.copy()
-                if msg.get("role") == "assistant":
-                    reasoning = msg.get("reasoning")
-                    if reasoning:
-                        api_msg["reasoning_content"] = reasoning
                 api_msg.pop("reasoning", None)
                 api_msg.pop("finish_reason", None)
                 api_msg.pop("_flush_sentinel", None)

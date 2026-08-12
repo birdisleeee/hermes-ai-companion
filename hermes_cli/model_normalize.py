@@ -117,6 +117,7 @@ _DEEPSEEK_REASONER_KEYWORDS: frozenset[str] = frozenset({
 _DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
     "deepseek-chat",
     "deepseek-reasoner",
+    "deepseek-v4-pro",
 })
 
 

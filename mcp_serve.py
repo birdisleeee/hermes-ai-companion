@@ -428,7 +428,9 @@ class EventBridge:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
+def create_mcp_server(event_bridge: Optional[EventBridge] = None,
+                       host: str = "127.0.0.1",
+                       port: int = 8000) -> "FastMCP":
     """Create and return the Hermes MCP server with all tools registered."""
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
@@ -443,6 +445,8 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             "conversations across Telegram, Discord, Slack, WhatsApp, Signal, "
             "Matrix, and other connected platforms."
         ),
+        host=host,
+        port=port,
     )
 
     bridge = event_bridge or EventBridge()
@@ -772,7 +776,8 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             return json.dumps({"count": len(targets), "channels": targets}, indent=2)
 
         channels = []
-        for plat, entries_list in directory.items():
+        platforms = directory.get("platforms", directory)
+        for plat, entries_list in platforms.items():
             if platform and plat.lower() != platform.lower():
                 continue
             if isinstance(entries_list, list):
@@ -833,8 +838,16 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_mcp_server(verbose: bool = False) -> None:
-    """Start the Hermes MCP server on stdio."""
+def run_mcp_server(verbose: bool = False, transport: str = "stdio",
+                   port: int = 8765, host: str = "0.0.0.0") -> None:
+    """Start the Hermes MCP server.
+
+    Args:
+        verbose: Enable debug logging.
+        transport: "stdio" (default) or "http" (StreamableHTTP).
+        port: Port for HTTP transport (default 8765).
+        host: Host for HTTP transport (default 0.0.0.0).
+    """
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server requires the 'mcp' package.\n"
@@ -851,13 +864,16 @@ def run_mcp_server(verbose: bool = False) -> None:
     bridge = EventBridge()
     bridge.start()
 
-    server = create_mcp_server(event_bridge=bridge)
+    server = create_mcp_server(event_bridge=bridge, host=host, port=port)
 
     import asyncio
 
     async def _run():
         try:
-            await server.run_stdio_async()
+            if transport == "http":
+                await server.run_streamable_http_async()
+            else:
+                await server.run_stdio_async()
         finally:
             bridge.stop()
 

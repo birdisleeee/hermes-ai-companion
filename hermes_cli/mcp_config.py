@@ -743,7 +743,12 @@ def mcp_command(args):
 
     if action == "serve":
         from mcp_serve import run_mcp_server
-        run_mcp_server(verbose=getattr(args, "verbose", False))
+        run_mcp_server(
+            verbose=getattr(args, "verbose", False),
+            transport=getattr(args, "transport", "stdio"),
+            port=getattr(args, "port", 8765),
+            host=getattr(args, "host", "0.0.0.0"),
+        )
         return
 
     handlers = {
