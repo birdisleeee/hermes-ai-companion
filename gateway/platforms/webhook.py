@@ -79,6 +79,13 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.reply_delivery import (
+    ReplyDeliveryConfig,
+    ReplyUnit,
+    build_fallback_reply_unit,
+    build_reply_units,
+    reply_delay_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +130,11 @@ class WebhookAdapter(BasePlatformAdapter):
         # Written by run.py _isles_voice_bridge_sync(), read+consumed by send().
         # dict {voice, transcript} or None.  Future: message_units[] list.
         self._pending_voice_meta: Optional[dict] = None
+
+        # Final user-turn marker keyed by the inbound Worker message ID.
+        # This is deliberately separate from session-keyed delivery_info:
+        # status messages and cron output must never inherit user-turn grouping.
+        self._pending_reply_turns: Dict[str, dict] = {}
 
         # Phase 4b.7d — per-message visible_reasoning cache
         # Written by run.py (future Phase 4a+4b activation), read by send(),
@@ -336,6 +348,44 @@ class WebhookAdapter(BasePlatformAdapter):
                 _combined_meta.update(_voice_meta)
             # ── end voice injection ──
 
+            _turn_marker = (
+                self._pending_reply_turns.get(reply_to)
+                if isinstance(reply_to, str) and reply_to
+                else None
+            )
+            if _turn_marker is not None:
+                _reply_config = delivery.get("reply_delivery")
+                if not isinstance(_reply_config, ReplyDeliveryConfig):
+                    _reply_config = ReplyDeliveryConfig()
+                _can_segment = (
+                    _reply_config.segmented
+                    and _voice_meta is None
+                    and "MEDIA:" not in content
+                )
+                _units = build_reply_units(
+                    content,
+                    turn_id=reply_to,
+                    config=_reply_config if _can_segment else ReplyDeliveryConfig(),
+                    origin="user_turn",
+                    context_window=_turn_marker.get("context_window"),
+                    final_meta=_combined_meta,
+                )
+                if not _units:
+                    _units = [ReplyUnit(content=content, meta=_combined_meta)]
+                if len(_units) > 1:
+                    _result = await self._deliver_grouped_http_callbacks(
+                        _units, delivery, reply_to, _reply_config
+                    )
+                else:
+                    _result = await self._deliver_http_callback(
+                        _units[0].content,
+                        delivery,
+                        meta=dict(_units[0].meta) if _units[0].meta else None,
+                    )
+                if _result.success:
+                    self._pending_reply_turns.pop(reply_to, None)
+                return _result
+
             return await self._deliver_http_callback(
                 content, delivery, meta=_combined_meta if _combined_meta else None
             )
@@ -408,6 +458,22 @@ class WebhookAdapter(BasePlatformAdapter):
         meta = self._pending_voice_meta
         self._pending_voice_meta = None
         return meta
+
+    def mark_pending_reply_turn(
+        self,
+        turn_id: str,
+        context_window: Optional[dict],
+    ) -> None:
+        """Mark one completed Isles user turn as eligible for final delivery."""
+
+        if not isinstance(turn_id, str) or not turn_id or any(ch.isspace() for ch in turn_id):
+            return
+        self._pending_reply_turns[turn_id] = {
+            "context_window": dict(context_window) if context_window else None,
+            "completed_at": time.time(),
+        }
+        while len(self._pending_reply_turns) > 200:
+            self._pending_reply_turns.pop(next(iter(self._pending_reply_turns)), None)
 
     # ── end voice bridge ──
 
@@ -593,6 +659,17 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
+            if route_config.get("deliver") == "http_callback":
+                return web.json_response(
+                    {
+                        "status": "accepted",
+                        "route": route_name,
+                        "event": event_type,
+                        "delivery_id": delivery_id,
+                        "duplicate": True,
+                    },
+                    status=202,
+                )
             return web.json_response(
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
@@ -675,10 +752,43 @@ class WebhookAdapter(BasePlatformAdapter):
                 route_config.get("deliver_extra", {}), payload
             ),
             "payload": payload,
+            # Capture the validated, default-off delivery contract. Per-turn
+            # identity comes
+            # from send(reply_to=event.message_id), not this session-keyed map,
+            # because HTTP callback routes intentionally share one session.
+            "reply_delivery": ReplyDeliveryConfig.from_route(route_config),
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
+
+        # Isles HTTP callbacks acknowledge ownership before auxiliary vision
+        # work.  The accepted task still performs the same enrichment before
+        # invoking the Agent, but the browser no longer waits up to 40 seconds
+        # for a truthful 202 handshake.
+        if route_config.get("deliver") == "http_callback":
+            task = asyncio.create_task(
+                self._handle_accepted_http_callback_event(
+                    prompt=prompt,
+                    payload=payload,
+                    deliver_config=deliver_config,
+                    session_chat_id=session_chat_id,
+                    route_name=route_name,
+                    event_type=event_type,
+                    delivery_id=delivery_id,
+                )
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                },
+                status=202,
+            )
 
         # ── v4.2.16 Phase 1b: aux vision bridge ──
         # Extract image from mixed message, call glm-4.6v vision aux,
@@ -850,6 +960,171 @@ class WebhookAdapter(BasePlatformAdapter):
             status=202,
         )
 
+    async def _handle_accepted_http_callback_event(
+        self,
+        *,
+        prompt: str,
+        payload: dict,
+        deliver_config: dict,
+        session_chat_id: str,
+        route_name: str,
+        event_type: str,
+        delivery_id: str,
+    ) -> None:
+        """Finish accepted Isles preprocessing and then run the Agent."""
+
+        try:
+            enriched_prompt = await self._enrich_isles_prompt_with_vision(
+                prompt,
+                payload,
+                deliver_config,
+            )
+            source = self.build_source(
+                chat_id=session_chat_id,
+                chat_name=f"webhook/{route_name}",
+                chat_type="webhook",
+                user_id=f"webhook:{route_name}",
+                user_name=route_name,
+            )
+            event = MessageEvent(
+                text=enriched_prompt,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=payload,
+                message_id=delivery_id,
+            )
+            logger.info(
+                "[webhook] accepted task event=%s route=%s prompt_len=%d delivery=%s",
+                event_type,
+                route_name,
+                len(enriched_prompt),
+                delivery_id,
+            )
+            await self.handle_message(event)
+        except Exception:
+            logger.exception(
+                "[webhook] accepted task failed route=%s delivery=%s",
+                route_name,
+                delivery_id,
+            )
+
+    async def _enrich_isles_prompt_with_vision(
+        self,
+        prompt: str,
+        payload: dict,
+        deliver_config: dict,
+    ) -> str:
+        """Run optional image enrichment after the webhook has been accepted."""
+
+        import os
+        import tempfile
+
+        message = payload.get("message", {})
+        images = message.get("images") or []
+        if not isinstance(images, list) or not images:
+            return prompt
+        image = images[0] if isinstance(images[0], dict) else {}
+        key = str(image.get("image_key") or "")
+        if (
+            not key.startswith("chat-images/")
+            or ".." in key
+            or "://" in key
+            or key.startswith("/")
+        ):
+            return prompt
+
+        token = deliver_config.get("deliver_extra", {}).get("token", "")
+        user_text = str(message.get("content", "") or "").strip()[:400]
+        media_url = "https://isles-story.site/api/media/file?key=" + quote(key, safe="/")
+        temporary_path = None
+        deadline = time.time() + 40
+        try:
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    media_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    body = await response.read()
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
+                    if response.status != 200 or not content_type.startswith("image/") or not body:
+                        logger.warning(
+                            "[webhook] vision media unavailable status=%d content_type=%s key=%s",
+                            response.status,
+                            content_type[:40],
+                            key[:40],
+                        )
+                        return prompt + "\n\n[辅助视觉识别结果：宝宝刚才发送了一张图片，但这次图片读取失败。]"
+                    suffix = {
+                        "image/png": ".png",
+                        "image/gif": ".gif",
+                        "image/webp": ".webp",
+                    }.get(content_type, ".jpg")
+                    file_descriptor, temporary_path = tempfile.mkstemp(
+                        prefix="isles_img_",
+                        suffix=suffix,
+                    )
+                    with os.fdopen(file_descriptor, "wb") as temporary_file:
+                        temporary_file.write(body)
+                    os.chmod(temporary_path, 0o600)
+
+            from tools.vision_tools import vision_analyze_tool
+
+            if user_text:
+                vision_prompt = (
+                    "请先简要描述整张图，再结合用户随图发送的文字重点检查相关细节。\n"
+                    f"用户随图发送的文字是：\n「{user_text}」\n"
+                    "如果图片中包含文字，请尽量转述；无法确认时请明确说不确定。"
+                )
+            else:
+                vision_prompt = (
+                    "请用一到两句话描述这张图片的主要内容。"
+                    "如果包含文字请尽量转述；无法确认时请明确说不确定。"
+                )
+            raw_result = await asyncio.wait_for(
+                vision_analyze_tool(
+                    image_url=temporary_path,
+                    user_prompt=vision_prompt,
+                    model="glm-4.6v",
+                ),
+                timeout=max(0.5, deadline - time.time()),
+            )
+            try:
+                parsed = json.loads(raw_result)
+                analysis = parsed.get("analysis", "") if parsed.get("success") else ""
+            except Exception:
+                analysis = ""
+            if not analysis:
+                return prompt
+            if user_text:
+                note = (
+                    "\n\n[辅助视觉识别结果：宝宝刚才发送了一张图片。\n"
+                    f"宝宝随图说：{user_text[:200]}\n"
+                    f"视觉模型结合这句话分析后的结果是：{str(analysis)[:500]}]"
+                )
+            else:
+                note = (
+                    "\n\n[辅助视觉识别结果：宝宝刚才发送了一张图片。\n"
+                    f"视觉模型对图片的简要描述是：{str(analysis)[:500]}]"
+                )
+            return prompt + note
+        except asyncio.TimeoutError:
+            logger.warning("[webhook] vision enrichment timed out key=%s", key[:40])
+            return prompt + "\n\n[辅助视觉识别结果：宝宝刚才发送了一张图片，但这次视觉分析超时。]"
+        except Exception as error:
+            logger.warning(
+                "[webhook] vision enrichment failed type=%s key=%s",
+                type(error).__name__,
+                key[:40],
+            )
+            return prompt
+        finally:
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+
     # ------------------------------------------------------------------
     # Signature validation
     # ------------------------------------------------------------------
@@ -946,6 +1221,54 @@ class WebhookAdapter(BasePlatformAdapter):
     # HTTP callback delivery (Isles Story)
     # ------------------------------------------------------------------
 
+    async def _deliver_grouped_http_callbacks(
+        self,
+        units: List[ReplyUnit],
+        delivery: dict,
+        turn_id: str,
+        config: ReplyDeliveryConfig,
+    ) -> "SendResult":
+        """Deliver stable message units in order with bounded transport retries."""
+
+        last_result = SendResult(success=False, error="No reply units")
+        for index, unit in enumerate(units):
+            for attempt in range(3):
+                last_result = await self._deliver_http_callback(
+                    unit.content,
+                    delivery,
+                    meta=dict(unit.meta),
+                )
+                if last_result.success:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+            if not last_result.success:
+                fallback = build_fallback_reply_unit(
+                    units,
+                    turn_id=turn_id,
+                    failed_index=index,
+                )
+                logger.warning(
+                    "[webhook] grouped callback segment %d/%d failed; sending fallback tail",
+                    index + 1,
+                    len(units),
+                )
+                return await self._deliver_http_callback(
+                    fallback.content,
+                    delivery,
+                    meta=dict(fallback.meta),
+                )
+            if index + 1 < len(units):
+                await asyncio.sleep(
+                    reply_delay_seconds(
+                        turn_id,
+                        index + 1,
+                        units[index + 1].content,
+                        config,
+                    )
+                )
+        return last_result
+
     async def _deliver_http_callback(
         self, content: str, delivery: dict, meta: Optional[dict] = None
     ) -> "SendResult":
@@ -978,6 +1301,22 @@ class WebhookAdapter(BasePlatformAdapter):
 
         else:
             payload = {"content": content, "author": "bird"}
+
+        if meta is not None and isinstance(meta, dict):
+            _payload_meta = payload.get("meta")
+            if not isinstance(_payload_meta, dict):
+                _payload_meta = {}
+            for _key in (
+                "reply_group",
+                "context_window",
+                "voice",
+                "transcript",
+                "spoken_text",
+            ):
+                if _key in meta:
+                    _payload_meta[_key] = meta[_key]
+            if _payload_meta:
+                payload["meta"] = _payload_meta
 
         # Phase 4b.7d — inject visible_reasoning meta
         # (schema-guarded + forbidden keywords, no-op when meta=None)
@@ -1014,14 +1353,12 @@ class WebhookAdapter(BasePlatformAdapter):
                             for kw in FORBIDDEN_SUBSTRINGS
                         )
                         if not _fb_hit:
-                            payload["meta"] = {
-                                "visible_reasoning": {
-                                    "summary": _summary.strip(),
-                                    "mode": "summary",
-                                    "intent": _intent.strip(),
-                                    "confidence": _confidence,
-                                    "durationMs": int(_duration),
-                                }
+                            payload.setdefault("meta", {})["visible_reasoning"] = {
+                                "summary": _summary.strip(),
+                                "mode": "summary",
+                                "intent": _intent.strip(),
+                                "confidence": _confidence,
+                                "durationMs": int(_duration),
                             }
                         # else: forbidden keyword hit → skip injection
             except Exception:
@@ -1076,7 +1413,12 @@ class WebhookAdapter(BasePlatformAdapter):
                         # v4.2.15: unified VIN Rewriter (async, additive)
                         # Replaces: Phase C2+C2a+D1-min dual path
                         # Old paths frozen below — kept for rollback only
-                        if (_msg_id and token and content):
+                        _reply_group = (payload.get("meta") or {}).get("reply_group")
+                        _is_final_reply = (
+                            not isinstance(_reply_group, dict)
+                            or _reply_group.get("is_final") is True
+                        )
+                        if (_msg_id and token and content and _is_final_reply):
                             _reasoning = None
                             if isinstance(meta, dict):
                                 _inner = meta.get("visible_inner_note")

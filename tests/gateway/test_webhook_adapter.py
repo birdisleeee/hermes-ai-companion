@@ -32,6 +32,7 @@ from gateway.platforms.webhook import (
     _INSECURE_NO_AUTH,
     check_webhook_requirements,
 )
+from gateway.reply_delivery import ReplyDeliveryConfig, build_reply_units
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +413,47 @@ class TestIdempotency:
             assert data["status"] == "duplicate"
 
     @pytest.mark.asyncio
+    async def test_duplicate_http_callback_repeats_accepted_handshake_without_second_run(self):
+        routes = {
+            "isles-story": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message.content}",
+                "deliver": "http_callback",
+                "deliver_extra": {"url": "https://example.invalid/callback"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as client:
+            headers = {"X-Request-ID": "msg_turn_duplicate"}
+            first = await client.post(
+                "/webhooks/isles-story",
+                json={"message": {"content": "hello"}},
+                headers=headers,
+            )
+            assert first.status == 202
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if adapter.handle_message.await_count:
+                    break
+            assert adapter.handle_message.await_count == 1
+
+            duplicate = await client.post(
+                "/webhooks/isles-story",
+                json={"message": {"content": "hello"}},
+                headers=headers,
+            )
+            assert duplicate.status == 202
+            body = await duplicate.json()
+            assert body["status"] == "accepted"
+            assert body["duplicate"] is True
+            assert body["route"] == "isles-story"
+            assert body["delivery_id"] == "msg_turn_duplicate"
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_expired_delivery_id_allows_reprocess(self):
         """After TTL expires, the same delivery ID is accepted again."""
         routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
@@ -588,6 +630,224 @@ class TestSessionIsolation:
 
 
 class TestDeliveryCleanup:
+
+    @pytest.mark.asyncio
+    async def test_http_callback_captures_default_off_reply_contract(self):
+        """Validated route settings are retained without changing send()."""
+        routes = {
+            "isles-story": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message.content}",
+                "deliver": "http_callback",
+                "deliver_extra": {"url": "https://example.invalid/callback"},
+                "reply_delivery": {
+                    "segmented": True,
+                    "require_user_turn_origin": True,
+                },
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/isles-story",
+                json={"message": {"content": "hello"}},
+                headers={"X-Request-ID": "msg_turn_123"},
+            )
+            assert response.status == 202
+
+        delivery = adapter._delivery_info["webhook:isles-story:main"]
+        assert delivery["reply_delivery"].segmented is True
+        assert delivery["reply_delivery"].require_user_turn_origin is True
+
+    @pytest.mark.asyncio
+    async def test_completed_user_turn_segments_only_when_route_enabled(self):
+        adapter = _make_adapter()
+        chat_id = "webhook:isles-story:main"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "http_callback",
+            "deliver_extra": {"url": "https://example.invalid/callback"},
+            "reply_delivery": ReplyDeliveryConfig(
+                segmented=True,
+                short_reply_max=20,
+                target_segment=55,
+                max_segments=8,
+                min_delay_ms=0,
+                max_delay_ms=0,
+            ),
+        }
+        adapter.mark_pending_reply_turn(
+            "msg_turn_123",
+            {
+                "used_tokens": 95_000,
+                "limit_tokens": 258_000,
+                "used_percent": 37,
+                "remaining_percent": 63,
+                "measured_at": "2026-08-17T10:00:10.000Z",
+            },
+        )
+        delivered = []
+
+        async def capture(content, delivery, meta=None):
+            delivered.append((content, meta))
+            return SendResult(success=True, message_id=f"msg_assistant_{len(delivered)}")
+
+        adapter._deliver_http_callback = AsyncMock(side_effect=capture)
+        result = await adapter.send(
+            chat_id,
+            "这是一段需要自然拆分的完整回复。" * 30,
+            reply_to="msg_turn_123",
+        )
+
+        assert result.success is True
+        assert 2 <= len(delivered) <= 8
+        groups = [meta["reply_group"] for _, meta in delivered]
+        assert [group["index"] for group in groups] == list(range(len(delivered)))
+        assert all(group["turn_id"] == "msg_turn_123" for group in groups)
+        assert all("context_window" not in meta for _, meta in delivered[:-1])
+        assert delivered[-1][1]["context_window"]["used_percent"] == 37
+        assert "msg_turn_123" not in adapter._pending_reply_turns
+
+    @pytest.mark.asyncio
+    async def test_unmarked_status_message_never_enters_user_turn_group(self):
+        adapter = _make_adapter()
+        chat_id = "webhook:isles-story:main"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "http_callback",
+            "deliver_extra": {"url": "https://example.invalid/callback"},
+            "reply_delivery": ReplyDeliveryConfig(segmented=True, short_reply_max=20),
+        }
+        adapter._deliver_http_callback = AsyncMock(
+            return_value=SendResult(success=True, message_id="msg_status")
+        )
+
+        result = await adapter.send(
+            chat_id,
+            "这是一条很长的状态通知。" * 30,
+            reply_to="msg_turn_status",
+        )
+
+        assert result.success is True
+        adapter._deliver_http_callback.assert_awaited_once()
+        assert adapter._deliver_http_callback.await_args.kwargs["meta"] is None
+
+    @pytest.mark.asyncio
+    async def test_disabled_route_keeps_one_callback_but_carries_context(self):
+        adapter = _make_adapter()
+        chat_id = "webhook:isles-story:main"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "http_callback",
+            "deliver_extra": {"url": "https://example.invalid/callback"},
+            "reply_delivery": ReplyDeliveryConfig(),
+        }
+        adapter.mark_pending_reply_turn(
+            "msg_turn_disabled",
+            {"used_tokens": 10, "limit_tokens": 100, "used_percent": 10},
+        )
+        adapter._deliver_http_callback = AsyncMock(
+            return_value=SendResult(success=True, message_id="msg_single")
+        )
+
+        result = await adapter.send(
+            chat_id,
+            "即使回复很长也仍然保持一条。" * 30,
+            reply_to="msg_turn_disabled",
+        )
+
+        assert result.success is True
+        adapter._deliver_http_callback.assert_awaited_once()
+        meta = adapter._deliver_http_callback.await_args.kwargs["meta"]
+        assert "reply_group" not in meta
+        assert meta["context_window"]["used_percent"] == 10
+
+    @pytest.mark.asyncio
+    async def test_grouped_delivery_retries_then_uses_stable_fallback_tail(self):
+        adapter = _make_adapter()
+        config = ReplyDeliveryConfig(
+            segmented=True,
+            short_reply_max=20,
+            target_segment=50,
+            min_delay_ms=0,
+            max_delay_ms=0,
+        )
+        units = build_reply_units(
+            "这是需要拆分并验证失败恢复的回复。" * 30,
+            turn_id="msg_turn_retry",
+            config=config,
+            context_window={"used_percent": 37},
+        )
+        assert len(units) > 2
+        calls = []
+
+        async def deliver(content, delivery, meta=None):
+            calls.append((content, meta))
+            group = meta["reply_group"]
+            if group.get("fallback_from_index") is not None:
+                return SendResult(success=True, message_id="msg_fallback")
+            if group["index"] == 1:
+                return SendResult(success=False, error="HTTP 503")
+            return SendResult(success=True, message_id="msg_first")
+
+        adapter._deliver_http_callback = AsyncMock(side_effect=deliver)
+        with patch("gateway.platforms.webhook.asyncio.sleep", new=AsyncMock()):
+            result = await adapter._deliver_grouped_http_callbacks(
+                units,
+                {"deliver_extra": {}},
+                "msg_turn_retry",
+                config,
+            )
+
+        assert result.success is True
+        fallback_group = calls[-1][1]["reply_group"]
+        assert fallback_group["segment_key"] == "msg_turn_retry:fallback:1"
+        assert fallback_group["fallback_from_index"] == 1
+        assert fallback_group["is_final"] is True
+        assert calls[-1][1]["context_window"]["used_percent"] == 37
+
+    @pytest.mark.asyncio
+    async def test_http_callback_returns_202_before_vision_preprocessing_finishes(self):
+        routes = {
+            "isles-story": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message.content}",
+                "deliver": "http_callback",
+                "deliver_extra": {"url": "https://example.invalid/callback"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        release_vision = asyncio.Event()
+
+        async def slow_vision(prompt, payload, delivery):
+            await release_vision.wait()
+            return prompt + " enriched"
+
+        adapter._enrich_isles_prompt_with_vision = AsyncMock(side_effect=slow_vision)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/webhooks/isles-story",
+                json={
+                    "message": {
+                        "content": "看看这张图",
+                        "images": [{"image_key": "chat-images/example.jpg"}],
+                    }
+                },
+                headers={"X-Request-ID": "msg_turn_fast_accept"},
+            )
+            assert response.status == 202
+            assert (await response.json())["delivery_id"] == "msg_turn_fast_accept"
+            await asyncio.sleep(0)
+            adapter._enrich_isles_prompt_with_vision.assert_awaited_once()
+            adapter.handle_message.assert_not_awaited()
+            release_vision.set()
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if adapter.handle_message.await_count:
+                    break
+            adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_delivery_info_survives_multiple_sends(self):
