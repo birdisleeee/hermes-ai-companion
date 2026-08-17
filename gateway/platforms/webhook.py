@@ -27,13 +27,16 @@ Security:
 """
 
 import asyncio
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -79,6 +82,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.isles_turn_store import IslesTurnStore
 from gateway.reply_delivery import (
     ReplyDeliveryConfig,
     ReplyUnit,
@@ -135,6 +139,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # This is deliberately separate from session-keyed delivery_info:
         # status messages and cron output must never inherit user-turn grouping.
         self._pending_reply_turns: Dict[str, dict] = {}
+        self._isles_turn_store = IslesTurnStore()
+        self._process_token = f"{os.getpid()}:{uuid.uuid4().hex}"
+        self._isles_retry_tasks: Dict[str, asyncio.Task] = {}
 
         # Phase 4b.7d — per-message visible_reasoning cache
         # Written by run.py (future Phase 4a+4b activation), read by send(),
@@ -218,6 +225,24 @@ class WebhookAdapter(BasePlatformAdapter):
         await site.start()
         self._mark_connected()
 
+        # An Agent run cannot survive a process restart.  Durable reply
+        # outboxes can, so resume those; mark other unfinished turns explicitly
+        # interrupted instead of leaving the island in an eternal typing state.
+        for record in self._isles_turn_store.recover_after_restart(self._process_token):
+            turn_id = record["turn_id"]
+            if record.get("state") == "delivery_failed" and record.get("outbox"):
+                self._schedule_isles_outbox_retry(turn_id)
+            elif record.get("state") == "interrupted":
+                asyncio.create_task(
+                    self._emit_isles_turn_status(
+                        turn_id,
+                        "interrupted",
+                        retryable=bool(record.get("retryable")),
+                        detail_code="gateway_restarted",
+                        route_name=str(record.get("route") or "isles-story"),
+                    )
+                )
+
         route_names = ", ".join(self._routes.keys()) or "(none configured)"
         logger.info(
             "[webhook] Listening on %s:%d — routes: %s",
@@ -228,6 +253,9 @@ class WebhookAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        for task in list(self._isles_retry_tasks.values()):
+            task.cancel()
+        self._isles_retry_tasks.clear()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -372,6 +400,22 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
                 if not _units:
                     _units = [ReplyUnit(content=content, meta=_combined_meta)]
+                if len(_units) == 1 and "reply_group" not in _units[0].meta:
+                    _single_meta = dict(_units[0].meta)
+                    _single_meta.update({
+                        "delivery_key": f"{reply_to}:final",
+                        "reply_turn_id": reply_to,
+                    })
+                    _units = [ReplyUnit(content=_units[0].content, meta=_single_meta)]
+
+                self._isles_turn_store.transition(
+                    reply_to,
+                    "delivering",
+                    retryable=True,
+                    process_token=self._process_token,
+                    outbox=[{"content": unit.content, "meta": dict(unit.meta)} for unit in _units],
+                )
+                await self._emit_isles_turn_status(reply_to, "delivering")
                 if len(_units) > 1:
                     _result = await self._deliver_grouped_http_callbacks(
                         _units, delivery, reply_to, _reply_config
@@ -384,6 +428,28 @@ class WebhookAdapter(BasePlatformAdapter):
                     )
                 if _result.success:
                     self._pending_reply_turns.pop(reply_to, None)
+                    self._isles_turn_store.transition(
+                        reply_to,
+                        "completed",
+                        retryable=False,
+                        process_token=self._process_token,
+                    )
+                    await self._emit_isles_turn_status(reply_to, "completed")
+                else:
+                    self._isles_turn_store.transition(
+                        reply_to,
+                        "delivery_failed",
+                        retryable=True,
+                        detail_code="callback_failed",
+                        process_token=self._process_token,
+                    )
+                    await self._emit_isles_turn_status(
+                        reply_to,
+                        "failed",
+                        retryable=True,
+                        detail_code="callback_failed",
+                    )
+                    self._schedule_isles_outbox_retry(reply_to)
                 return _result
 
             return await self._deliver_http_callback(
@@ -474,6 +540,163 @@ class WebhookAdapter(BasePlatformAdapter):
         }
         while len(self._pending_reply_turns) > 200:
             self._pending_reply_turns.pop(next(iter(self._pending_reply_turns)), None)
+        self._isles_turn_store.transition(
+            turn_id,
+            "reply_ready",
+            retryable=True,
+            process_token=self._process_token,
+        )
+
+    async def update_isles_turn_status(
+        self,
+        turn_id: str,
+        status: str,
+        *,
+        retryable: bool = False,
+        detail_code: str | None = None,
+    ) -> None:
+        """Persist and forward a real Agent lifecycle event to the Worker."""
+
+        if not isinstance(turn_id, str) or not turn_id:
+            return
+        state = status if status != "failed" else "processing_failed"
+        self._isles_turn_store.transition(
+            turn_id,
+            state,
+            retryable=retryable,
+            detail_code=detail_code,
+            process_token=self._process_token,
+        )
+        await self._emit_isles_turn_status(
+            turn_id,
+            status,
+            retryable=retryable,
+            detail_code=detail_code,
+        )
+
+    def _static_isles_delivery(self, route_name: str = "isles-story") -> dict:
+        route = self._routes.get(route_name, {})
+        return {
+            "deliver": route.get("deliver", "log"),
+            "deliver_extra": self._render_delivery_extra(route.get("deliver_extra", {}), {}),
+            "reply_delivery": ReplyDeliveryConfig.from_route(route),
+        }
+
+    async def _emit_isles_turn_status(
+        self,
+        turn_id: str,
+        status: str,
+        *,
+        retryable: bool = False,
+        detail_code: str | None = None,
+        route_name: str = "isles-story",
+    ) -> bool:
+        """Send metadata-only state; never create a visible chat message."""
+
+        delivery = self._static_isles_delivery(route_name)
+        extra = delivery.get("deliver_extra", {})
+        callback_url = str(extra.get("url") or "")
+        token = str(extra.get("token") or "")
+        if not callback_url or not token:
+            return False
+        if "/api/chat/callback" in callback_url:
+            status_url = callback_url.rsplit("/api/chat/callback", 1)[0] + "/api/chat/turn/status"
+        else:
+            status_url = callback_url.rstrip("/") + "/turn/status"
+        payload = {
+            "turn_id": turn_id,
+            "status": status,
+            "retryable": bool(retryable),
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        }
+        if detail_code:
+            payload["detail_code"] = detail_code
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    status_url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    return 200 <= response.status < 300
+        except Exception as error:
+            logger.warning(
+                "[webhook] turn status delivery failed status=%s type=%s turn=%s",
+                status,
+                type(error).__name__,
+                hashlib.sha256(turn_id.encode()).hexdigest()[:8],
+            )
+            return False
+
+    def _schedule_isles_outbox_retry(self, turn_id: str) -> None:
+        existing = self._isles_retry_tasks.get(turn_id)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(self._retry_isles_outbox(turn_id))
+        self._isles_retry_tasks[turn_id] = task
+        task.add_done_callback(lambda _: self._isles_retry_tasks.pop(turn_id, None))
+
+    async def _retry_isles_outbox(self, turn_id: str) -> None:
+        delay = 5.0
+        while self.is_connected:
+            record = self._isles_turn_store.get(turn_id)
+            if not record or not record.get("outbox"):
+                return
+            if record.get("state") not in {"delivery_failed", "delivering"}:
+                return
+            if await self._resume_isles_outbox(record):
+                return
+            await asyncio.sleep(delay)
+            delay = min(60.0, delay * 2)
+
+    async def _resume_isles_outbox(self, record: dict) -> bool:
+        turn_id = str(record.get("turn_id") or "")
+        route_name = str(record.get("route") or "isles-story")
+        units = [
+            ReplyUnit(content=str(item.get("content") or ""), meta=dict(item.get("meta") or {}))
+            for item in record.get("outbox", [])
+            if isinstance(item, dict) and item.get("content") is not None
+        ]
+        if not turn_id or not units:
+            return False
+        delivery = self._static_isles_delivery(route_name)
+        config = delivery.get("reply_delivery")
+        if not isinstance(config, ReplyDeliveryConfig):
+            config = ReplyDeliveryConfig()
+        self._isles_turn_store.transition(
+            turn_id,
+            "delivering",
+            retryable=True,
+            process_token=self._process_token,
+        )
+        await self._emit_isles_turn_status(turn_id, "delivering", route_name=route_name)
+        if len(units) > 1:
+            result = await self._deliver_grouped_http_callbacks(units, delivery, turn_id, config)
+        else:
+            result = await self._deliver_http_callback(
+                units[0].content,
+                delivery,
+                meta=dict(units[0].meta),
+            )
+        if not result.success:
+            self._isles_turn_store.transition(
+                turn_id,
+                "delivery_failed",
+                retryable=True,
+                detail_code="callback_failed",
+                process_token=self._process_token,
+            )
+            return False
+        self._pending_reply_turns.pop(turn_id, None)
+        self._isles_turn_store.transition(
+            turn_id,
+            "completed",
+            retryable=False,
+            process_token=self._process_token,
+        )
+        await self._emit_isles_turn_status(turn_id, "completed", route_name=route_name)
+        return True
 
     # ── end voice bridge ──
 
@@ -647,19 +870,66 @@ class WebhookAdapter(BasePlatformAdapter):
         )
 
         # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
+        # Generic routes keep the historical in-memory TTL.  Isles receipts
+        # additionally use a durable journal so a restart or background-task
+        # failure cannot be misreported as a healthy duplicate.
         now = time.time()
+        is_http_callback = route_config.get("deliver") == "http_callback"
+        is_durable_isles = is_http_callback and route_name == "isles-story"
         # Prune expired entries
         self._seen_deliveries = {
             k: v
             for k, v in self._seen_deliveries.items()
             if now - v < self._idempotency_ttl
         }
-        if delivery_id in self._seen_deliveries:
+        durable_record = self._isles_turn_store.get(delivery_id) if is_durable_isles else None
+        payload_sha256 = self._isles_turn_store.payload_fingerprint(raw_body)
+        if durable_record and durable_record.get("payload_sha256") != payload_sha256:
+            return web.json_response(
+                {"status": "conflict", "delivery_id": delivery_id},
+                status=409,
+            )
+
+        retry_durable_turn = bool(
+            durable_record
+            and durable_record.get("retryable")
+            and durable_record.get("state") in {"interrupted", "processing_failed"}
+        )
+        if durable_record and durable_record.get("state") == "delivery_failed" and durable_record.get("outbox"):
+            self._schedule_isles_outbox_retry(delivery_id)
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                    "turn_status": "delivering",
+                    "duplicate": True,
+                },
+                status=202,
+            )
+
+        if durable_record and not retry_durable_turn:
+            durable_state = str(durable_record.get("state") or "accepted")
+            response_status = "accepted" if durable_state not in {"interrupted", "processing_failed"} else "failed"
+            return web.json_response(
+                {
+                    "status": response_status,
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                    "turn_status": durable_state,
+                    "retryable": bool(durable_record.get("retryable")),
+                    "duplicate": True,
+                },
+                status=202 if response_status == "accepted" else 409,
+            )
+
+        if delivery_id in self._seen_deliveries and not retry_durable_turn:
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
-            if route_config.get("deliver") == "http_callback":
+            if is_http_callback:
                 return web.json_response(
                     {
                         "status": "accepted",
@@ -675,6 +945,21 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=200,
             )
         self._seen_deliveries[delivery_id] = now
+        if is_durable_isles:
+            if durable_record:
+                self._isles_turn_store.transition(
+                    delivery_id,
+                    "accepted",
+                    retryable=False,
+                    process_token=self._process_token,
+                )
+            else:
+                self._isles_turn_store.receive(
+                    delivery_id,
+                    payload_sha256=payload_sha256,
+                    route=route_name,
+                    process_token=self._process_token,
+                )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
@@ -786,6 +1071,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     "route": route_name,
                     "event": event_type,
                     "delivery_id": delivery_id,
+                    "turn_status": "accepted",
                 },
                 status=202,
             )
@@ -974,6 +1260,18 @@ class WebhookAdapter(BasePlatformAdapter):
         """Finish accepted Isles preprocessing and then run the Agent."""
 
         try:
+            if route_name == "isles-story":
+                self._isles_turn_store.transition(
+                    delivery_id,
+                    "processing",
+                    retryable=False,
+                    process_token=self._process_token,
+                )
+                await self._emit_isles_turn_status(
+                    delivery_id,
+                    "processing",
+                    route_name=route_name,
+                )
             enriched_prompt = await self._enrich_isles_prompt_with_vision(
                 prompt,
                 payload,
@@ -1002,6 +1300,21 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             await self.handle_message(event)
         except Exception:
+            if route_name == "isles-story":
+                self._isles_turn_store.transition(
+                    delivery_id,
+                    "processing_failed",
+                    retryable=True,
+                    detail_code="agent_task_failed",
+                    process_token=self._process_token,
+                )
+                await self._emit_isles_turn_status(
+                    delivery_id,
+                    "failed",
+                    retryable=True,
+                    detail_code="agent_task_failed",
+                    route_name=route_name,
+                )
             logger.exception(
                 "[webhook] accepted task failed route=%s delivery=%s",
                 route_name,
@@ -1308,6 +1621,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 _payload_meta = {}
             for _key in (
                 "reply_group",
+                "delivery_key",
+                "reply_turn_id",
                 "context_window",
                 "voice",
                 "transcript",

@@ -2087,7 +2087,7 @@ class AIAgent:
             and getattr(self, "platform", "") == "cli"
         )
 
-    def _emit_status(self, message: str) -> None:
+    def _emit_status(self, message: str, event_type: str = "lifecycle") -> None:
         """Emit a lifecycle status message to both CLI and gateway channels.
 
         CLI users see the message via ``_vprint(force=True)`` so it is always
@@ -2103,7 +2103,7 @@ class AIAgent:
             pass
         if self.status_callback:
             try:
-                self.status_callback("lifecycle", message)
+                self.status_callback(event_type, message)
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
@@ -7434,6 +7434,7 @@ class AIAgent:
             (compressed_messages, new_system_prompt) tuple
         """
         _pre_msg_count = len(messages)
+        self._emit_status("Compacting conversation context…", "context:compacting")
         logger.info(
             "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
             self.session_id or "none", _pre_msg_count,
@@ -7522,6 +7523,7 @@ class AIAgent:
             self.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
         )
+        self._emit_status("Conversation context is ready.", "context:ready")
         return compressed, new_system_prompt
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:

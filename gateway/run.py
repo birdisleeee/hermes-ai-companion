@@ -5069,6 +5069,17 @@ class GatewayRunner:
                     )
 
                     _hyg_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    _hyg_status_adapter = self.adapters.get(source.platform)
+                    if (
+                        event.message_id
+                        and self.is_isles_story_source(source)
+                        and _hyg_status_adapter
+                        and hasattr(_hyg_status_adapter, "update_isles_turn_status")
+                    ):
+                        await _hyg_status_adapter.update_isles_turn_status(
+                            event.message_id,
+                            "compacting",
+                        )
 
                     try:
                         from run_agent import AIAgent
@@ -5148,6 +5159,17 @@ class GatewayRunner:
                         logger.warning(
                             "Session hygiene auto-compress failed: %s", e
                         )
+                    finally:
+                        if (
+                            event.message_id
+                            and self.is_isles_story_source(source)
+                            and _hyg_status_adapter
+                            and hasattr(_hyg_status_adapter, "update_isles_turn_status")
+                        ):
+                            await _hyg_status_adapter.update_isles_turn_status(
+                                event.message_id,
+                                "processing",
+                            )
 
         # First-message onboarding -- only on the very first interaction ever
         if not history and not self.session_store.has_any_sessions():
@@ -10609,6 +10631,18 @@ class GatewayRunner:
             if not _status_adapter or not _run_still_current():
                 return
             try:
+                if (
+                    event_message_id
+                    and self.is_isles_story_source(source)
+                    and hasattr(_status_adapter, "update_isles_turn_status")
+                    and event_type in {"context:compacting", "context:ready"}
+                ):
+                    status = "compacting" if event_type == "context:compacting" else "processing"
+                    asyncio.run_coroutine_threadsafe(
+                        _status_adapter.update_isles_turn_status(event_message_id, status),
+                        _loop_for_step,
+                    )
+                    return
                 asyncio.run_coroutine_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,

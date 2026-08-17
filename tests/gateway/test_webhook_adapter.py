@@ -454,6 +454,98 @@ class TestIdempotency:
             assert adapter.handle_message.await_count == 1
 
     @pytest.mark.asyncio
+    async def test_duplicate_with_durable_failed_outbox_resumes_delivery_not_agent(self):
+        routes = {
+            "isles-story": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message.content}",
+                "deliver": "http_callback",
+                "deliver_extra": {"url": "https://example.invalid/api/chat/callback"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+        app = _create_app(adapter)
+        payload = {"message": {"content": "hello"}}
+
+        async with TestClient(TestServer(app)) as client:
+            first = await client.post(
+                "/webhooks/isles-story",
+                json=payload,
+                headers={"X-Request-ID": "msg_turn_outbox"},
+            )
+            assert first.status == 202
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if adapter.handle_message.await_count:
+                    break
+            adapter._isles_turn_store.transition(
+                "msg_turn_outbox",
+                "delivery_failed",
+                retryable=True,
+                outbox=[{
+                    "content": "finished reply",
+                    "meta": {
+                        "delivery_key": "msg_turn_outbox:final",
+                        "reply_turn_id": "msg_turn_outbox",
+                    },
+                }],
+            )
+            adapter._schedule_isles_outbox_retry = MagicMock()
+
+            duplicate = await client.post(
+                "/webhooks/isles-story",
+                json=payload,
+                headers={"X-Request-ID": "msg_turn_outbox"},
+            )
+            assert duplicate.status == 202
+            body = await duplicate.json()
+            assert body["turn_status"] == "delivering"
+            assert body["duplicate"] is True
+            assert adapter.handle_message.await_count == 1
+            adapter._schedule_isles_outbox_retry.assert_called_once_with("msg_turn_outbox")
+
+    @pytest.mark.asyncio
+    async def test_failed_background_task_can_retry_same_durable_turn(self):
+        routes = {
+            "isles-story": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message.content}",
+                "deliver": "http_callback",
+                "deliver_extra": {"url": "https://example.invalid/api/chat/callback"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock(side_effect=[RuntimeError("boom"), None])
+        adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+        app = _create_app(adapter)
+        headers = {"X-Request-ID": "msg_turn_background_retry"}
+        payload = {"message": {"content": "hello"}}
+
+        async with TestClient(TestServer(app)) as client:
+            first = await client.post("/webhooks/isles-story", json=payload, headers=headers)
+            assert first.status == 202
+            for _ in range(20):
+                await asyncio.sleep(0)
+                record = adapter._isles_turn_store.get("msg_turn_background_retry")
+                if record and record.get("state") == "processing_failed":
+                    break
+            assert record["state"] == "processing_failed"
+            assert record["retryable"] is True
+
+            retry = await client.post("/webhooks/isles-story", json=payload, headers=headers)
+            assert retry.status == 202
+            body = await retry.json()
+            assert body["status"] == "accepted"
+            assert body["turn_status"] == "accepted"
+            for _ in range(20):
+                await asyncio.sleep(0)
+                if adapter.handle_message.await_count == 2:
+                    break
+            assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_expired_delivery_id_allows_reprocess(self):
         """After TTL expires, the same delivery ID is accepted again."""
         routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
