@@ -72,6 +72,7 @@ from gateway.reply_delivery import (
     ReplyUnit,
     build_context_window,
     build_fallback_reply_unit,
+    build_reply_units,
     reply_delay_seconds,
 )
 
@@ -690,6 +691,94 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "http_callback":
+            # ── v4.2.19: isles-story delivery (ported from giz) ──
+            # _combined_meta: voice injection only for now (VR/inner_note → fp7)
+            _combined_meta: Dict[str, Any] = {}
+            _voice_meta = self.consume_pending_voice_meta()
+            if _voice_meta is not None:
+                _combined_meta.update(_voice_meta)
+
+            _turn_marker = (
+                self._pending_reply_turns.get(reply_to)
+                if isinstance(reply_to, str) and reply_to
+                else None
+            )
+            if _turn_marker is not None:
+                _reply_config = delivery.get("reply_delivery")
+                if not isinstance(_reply_config, ReplyDeliveryConfig):
+                    _reply_config = ReplyDeliveryConfig()
+                _can_segment = (
+                    _reply_config.segmented
+                    and _voice_meta is None
+                    and "MEDIA:" not in content
+                )
+                _units = build_reply_units(
+                    content,
+                    turn_id=reply_to,
+                    config=_reply_config if _can_segment else ReplyDeliveryConfig(),
+                    origin="user_turn",
+                    context_window=_turn_marker.get("context_window"),
+                    final_meta=_combined_meta,
+                )
+                if not _units:
+                    _units = [ReplyUnit(content=content, meta=_combined_meta)]
+                if len(_units) == 1 and "reply_group" not in _units[0].meta:
+                    _single_meta = dict(_units[0].meta)
+                    _single_meta.update({
+                        "delivery_key": f"{reply_to}:final",
+                        "reply_turn_id": reply_to,
+                    })
+                    _units = [ReplyUnit(content=_units[0].content, meta=_single_meta)]
+
+                self._isles_turn_store.transition(
+                    reply_to,
+                    "delivering",
+                    retryable=True,
+                    process_token=self._process_token,
+                    outbox=[{"content": unit.content, "meta": dict(unit.meta)} for unit in _units],
+                )
+                await self._emit_isles_turn_status(reply_to, "delivering")
+                if len(_units) > 1:
+                    _result = await self._deliver_grouped_http_callbacks(
+                        _units, delivery, reply_to, _reply_config
+                    )
+                else:
+                    _result = await self._deliver_http_callback(
+                        _units[0].content,
+                        delivery,
+                        meta=dict(_units[0].meta) if _units[0].meta else None,
+                    )
+                if _result.success:
+                    self._pending_reply_turns.pop(reply_to, None)
+                    self._isles_turn_store.transition(
+                        reply_to,
+                        "completed",
+                        retryable=False,
+                        process_token=self._process_token,
+                    )
+                    await self._emit_isles_turn_status(reply_to, "completed")
+                else:
+                    self._isles_turn_store.transition(
+                        reply_to,
+                        "delivery_failed",
+                        retryable=True,
+                        detail_code="callback_failed",
+                        process_token=self._process_token,
+                    )
+                    await self._emit_isles_turn_status(
+                        reply_to,
+                        "failed",
+                        retryable=True,
+                        detail_code="callback_failed",
+                    )
+                    self._schedule_isles_outbox_retry(reply_to)
+                return _result
+
+            return await self._deliver_http_callback(
+                content, delivery, meta=_combined_meta if _combined_meta else None
+            )
 
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
