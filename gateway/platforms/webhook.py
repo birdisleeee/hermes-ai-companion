@@ -44,6 +44,7 @@ import sys
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -66,7 +67,13 @@ from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
     WebhookRouteProcessor,
 )
-from gateway.reply_delivery import ReplyDeliveryConfig
+from gateway.reply_delivery import (
+    ReplyDeliveryConfig,
+    ReplyUnit,
+    build_context_window,
+    build_fallback_reply_unit,
+    reply_delay_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +234,327 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(
             script_timeout_seconds=self._script_timeout_seconds
         )
+
+    # ── v4.2.19: isles-story voice bridge + turn delivery (ported from giz) ──
+
+    def set_pending_voice_meta(self, voice_meta: Optional[dict]) -> None:
+        """Set voice metadata for the upcoming callback.
+
+        Called by run.py _isles_voice_bridge_sync() before return response.
+        voice_meta is {voice: {audio_key, mime, duration_ms, size},
+                        transcript: {text, status, provider}} or None.
+        None triggers text-only fallback.
+        """
+        self._pending_voice_meta = voice_meta
+
+    def consume_pending_voice_meta(self) -> Optional[dict]:
+        """Atomically read and clear pending voice metadata.
+
+        Called by send() during callback assembly.
+        Returns the voice_meta dict or None.
+        """
+        meta = self._pending_voice_meta
+        self._pending_voice_meta = None
+        return meta
+
+    def mark_pending_reply_turn(
+        self,
+        turn_id: str,
+        context_window: Optional[dict],
+    ) -> None:
+        """Mark one completed Isles user turn as eligible for final delivery."""
+        if not isinstance(turn_id, str) or not turn_id or any(ch.isspace() for ch in turn_id):
+            return
+        self._pending_reply_turns[turn_id] = {
+            "context_window": dict(context_window) if context_window else None,
+            "completed_at": time.time(),
+        }
+        while len(self._pending_reply_turns) > 200:
+            self._pending_reply_turns.pop(next(iter(self._pending_reply_turns)), None)
+        self._isles_turn_store.transition(
+            turn_id,
+            "reply_ready",
+            retryable=True,
+            process_token=self._process_token,
+        )
+
+    async def update_isles_turn_status(
+        self,
+        turn_id: str,
+        status: str,
+        *,
+        retryable: bool = False,
+        detail_code: str | None = None,
+    ) -> None:
+        """Persist and forward a real Agent lifecycle event to the Worker."""
+        if not isinstance(turn_id, str) or not turn_id:
+            return
+        state = status if status != "failed" else "processing_failed"
+        self._isles_turn_store.transition(
+            turn_id,
+            state,
+            retryable=retryable,
+            detail_code=detail_code,
+            process_token=self._process_token,
+        )
+        await self._emit_isles_turn_status(
+            turn_id,
+            status,
+            retryable=retryable,
+            detail_code=detail_code,
+        )
+
+    def _static_isles_delivery(self, route_name: str = "isles-story") -> dict:
+        route = self._routes.get(route_name, {})
+        return {
+            "deliver": route.get("deliver", "log"),
+            "deliver_extra": self._render_delivery_extra(route.get("deliver_extra", {}), {}),
+            "reply_delivery": ReplyDeliveryConfig.from_route(route),
+        }
+
+    async def _emit_isles_turn_status(
+        self,
+        turn_id: str,
+        status: str,
+        *,
+        retryable: bool = False,
+        detail_code: str | None = None,
+        route_name: str = "isles-story",
+    ) -> bool:
+        """Send metadata-only state; never create a visible chat message."""
+        import aiohttp
+
+        delivery = self._static_isles_delivery(route_name)
+        extra = delivery.get("deliver_extra", {})
+        callback_url = str(extra.get("url") or "")
+        token = str(extra.get("token") or "")
+        if not callback_url or not token:
+            return False
+        if "/api/chat/callback" in callback_url:
+            status_url = callback_url.rsplit("/api/chat/callback", 1)[0] + "/api/chat/turn/status"
+        else:
+            status_url = callback_url.rstrip("/") + "/turn/status"
+        payload = {
+            "turn_id": turn_id,
+            "status": status,
+            "retryable": bool(retryable),
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        }
+        if detail_code:
+            payload["detail_code"] = detail_code
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    status_url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    return 200 <= response.status < 300
+        except Exception as error:
+            logger.warning(
+                "[webhook] turn status delivery failed status=%s type=%s turn=%s",
+                status,
+                type(error).__name__,
+                hashlib.sha256(turn_id.encode()).hexdigest()[:8],
+            )
+            return False
+
+    def _schedule_isles_outbox_retry(self, turn_id: str) -> None:
+        existing = self._isles_retry_tasks.get(turn_id)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(self._retry_isles_outbox(turn_id))
+        self._isles_retry_tasks[turn_id] = task
+        task.add_done_callback(lambda _: self._isles_retry_tasks.pop(turn_id, None))
+
+    async def _retry_isles_outbox(self, turn_id: str) -> None:
+        delay = 5.0
+        while self.is_connected:
+            record = self._isles_turn_store.get(turn_id)
+            if not record or not record.get("outbox"):
+                return
+            if record.get("state") not in {"delivery_failed", "delivering"}:
+                return
+            if await self._resume_isles_outbox(record):
+                return
+            await asyncio.sleep(delay)
+            delay = min(60.0, delay * 2)
+
+    async def _resume_isles_outbox(self, record: dict) -> bool:
+        turn_id = str(record.get("turn_id") or "")
+        route_name = str(record.get("route") or "isles-story")
+        units = [
+            ReplyUnit(content=str(item.get("content") or ""), meta=dict(item.get("meta") or {}))
+            for item in record.get("outbox", [])
+            if isinstance(item, dict) and item.get("content") is not None
+        ]
+        if not turn_id or not units:
+            return False
+        delivery = self._static_isles_delivery(route_name)
+        config = delivery.get("reply_delivery")
+        if not isinstance(config, ReplyDeliveryConfig):
+            config = ReplyDeliveryConfig()
+        self._isles_turn_store.transition(
+            turn_id,
+            "delivering",
+            retryable=True,
+            process_token=self._process_token,
+        )
+        await self._emit_isles_turn_status(turn_id, "delivering", route_name=route_name)
+        if len(units) > 1:
+            result = await self._deliver_grouped_http_callbacks(units, delivery, turn_id, config)
+        else:
+            result = await self._deliver_http_callback(
+                units[0].content,
+                delivery,
+                meta=dict(units[0].meta),
+            )
+        if not result.success:
+            self._isles_turn_store.transition(
+                turn_id,
+                "delivery_failed",
+                retryable=True,
+                detail_code="callback_failed",
+                process_token=self._process_token,
+            )
+            return False
+        self._pending_reply_turns.pop(turn_id, None)
+        self._isles_turn_store.transition(
+            turn_id,
+            "completed",
+            retryable=False,
+            process_token=self._process_token,
+        )
+        await self._emit_isles_turn_status(turn_id, "completed", route_name=route_name)
+        return True
+
+    async def _deliver_grouped_http_callbacks(
+        self,
+        units: List[ReplyUnit],
+        delivery: dict,
+        turn_id: str,
+        config: ReplyDeliveryConfig,
+    ) -> "SendResult":
+        """Deliver stable message units in order with bounded transport retries."""
+        last_result = SendResult(success=False, error="No reply units")
+        for index, unit in enumerate(units):
+            for attempt in range(3):
+                last_result = await self._deliver_http_callback(
+                    unit.content,
+                    delivery,
+                    meta=dict(unit.meta),
+                )
+                if last_result.success:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+            if not last_result.success:
+                fallback = build_fallback_reply_unit(
+                    units,
+                    turn_id=turn_id,
+                    failed_index=index,
+                )
+                logger.warning(
+                    "[webhook] grouped callback segment %d/%d failed; sending fallback tail",
+                    index + 1,
+                    len(units),
+                )
+                return await self._deliver_http_callback(
+                    fallback.content,
+                    delivery,
+                    meta=dict(fallback.meta),
+                )
+            if index + 1 < len(units):
+                await asyncio.sleep(
+                    reply_delay_seconds(
+                        turn_id,
+                        index + 1,
+                        units[index + 1].content,
+                        config,
+                    )
+                )
+        return last_result
+
+    async def _deliver_http_callback(
+        self, content: str, delivery: dict, meta: Optional[dict] = None
+    ) -> "SendResult":
+        """POST agent response to a callback URL."""
+        import aiohttp
+
+        url = delivery.get("deliver_extra", {}).get("url", "")
+        token = delivery.get("deliver_extra", {}).get("token", "")
+        if not url:
+            logger.warning("[webhook] http_callback missing url")
+            return SendResult(success=False, error="Missing callback URL")
+
+        # Build payload (frontend contract: msg.meta.visible_reasoning)
+        if delivery.get("deliver_extra", {}).get("forward_raw_body"):
+            payload = delivery.get("payload", {"content": content, "author": "bird"})
+        elif meta and isinstance(meta, dict) and 'voice' in meta:
+            payload = {
+                "content": "",
+                "author": "bird",
+                "type": "voice",
+                "meta": meta,
+            }
+            logger.info(
+                "[webhook] voice callback audio_key=%s duration_ms=%s",
+                meta.get("voice", {}).get("audio_key", "?"),
+                meta.get("voice", {}).get("duration_ms", "?"),
+            )
+        else:
+            payload = {"content": content, "author": "bird"}
+
+        if meta is not None and isinstance(meta, dict):
+            _payload_meta = payload.get("meta")
+            if not isinstance(_payload_meta, dict):
+                _payload_meta = {}
+            for _key in (
+                "reply_group",
+                "delivery_key",
+                "reply_turn_id",
+                "context_window",
+                "voice",
+                "transcript",
+                "spoken_text",
+            ):
+                if _key in meta:
+                    _payload_meta[_key] = meta[_key]
+            if _payload_meta:
+                payload["meta"] = _payload_meta
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "hermes-webhook/1.0",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=payload, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status == 200:
+                        _msg_id = None
+                        try:
+                            _body = await resp.json()
+                            _raw_id = (_body.get("message") or {}).get("id")
+                            if isinstance(_raw_id, str) and _raw_id.startswith("msg_"):
+                                _msg_id = _raw_id
+                        except Exception:
+                            pass  # fail-open: body parse failure -> msg_id stays None
+                        logger.info("[webhook] http_callback OK")
+                        # TODO(fp7): VIN rewriter async delivery omitted for now
+                        return SendResult(success=True, message_id=_msg_id)
+                    body = await resp.text()
+                    logger.warning(
+                        "[webhook] http_callback %d: %s", resp.status, body[:200]
+                    )
+                    return SendResult(success=False, error=f"HTTP {resp.status}")
+        except Exception as e:
+            logger.error("[webhook] http_callback failed: %s", e)
+            return SendResult(success=False, error=str(e))
 
     # ------------------------------------------------------------------
     # Lifecycle
