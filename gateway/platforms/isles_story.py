@@ -36,6 +36,30 @@ class IslesStoryAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WEBHOOK)
+        # v4.2.19: voice message bridge state — written by run.py
+        # _isles_voice_bridge_sync() before the callback, read+consumed by
+        # send() during callback assembly. {voice, transcript, spoken_text}
+        self._pending_voice_meta: Optional[dict] = None
+
+    def set_pending_voice_meta(self, voice_meta: Optional[dict]) -> None:
+        """Set voice metadata for the upcoming callback.
+
+        Called by run.py _isles_voice_bridge_sync() before return response.
+        voice_meta is {voice: {audio_key, mime, duration_ms, size},
+                        transcript: {text, status, provider}} or None.
+        None triggers text-only fallback.
+        """
+        self._pending_voice_meta = voice_meta
+
+    def consume_pending_voice_meta(self) -> Optional[dict]:
+        """Atomically read and clear pending voice metadata.
+
+        Called by send() during callback assembly.
+        Returns the voice_meta dict or None.
+        """
+        meta = self._pending_voice_meta
+        self._pending_voice_meta = None
+        return meta
 
     async def send(
         self,
