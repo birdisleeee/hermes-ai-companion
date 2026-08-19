@@ -1922,6 +1922,7 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.turn_lease import SessionTurnLeaseRegistry
+from gateway.reply_delivery import build_context_window
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -13472,6 +13473,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
+
+            # ── v4.2.19: isles-story voice bridge (ported from giz v0.10.0) ──
+            _isles = (
+                event.source.platform == Platform.WEBHOOK
+                and self.is_isles_story_source(event.source)
+            )
+            if _isles and response and not _already_sent:
+                _context_window = build_context_window(
+                    agent_result.get("last_prompt_tokens", 0),
+                    agent_result.get("context_length", 0),
+                )
+                webhook = self.adapters.get(event.source.platform)
+                if webhook and hasattr(webhook, "mark_pending_reply_turn"):
+                    webhook.mark_pending_reply_turn(event.message_id, _context_window)
+
+            # ── v4.2.19-phase2b: voice intent boundary ──
+            _has_existing_audio = "MEDIA:" in (response or "")
+            if _isles and response and _has_existing_audio:
+                logger.info("[isles-voice] existing audio detected in response")
+                voice_meta = await self._isles_voice_bridge_sync(response)
+                webhook = self.adapters.get(event.source.platform)
+                if webhook and hasattr(webhook, 'set_pending_voice_meta'):
+                    webhook.set_pending_voice_meta(voice_meta)
+                if voice_meta:
+                    logger.info("[isles-voice] bridged audio_key=%s",
+                                voice_meta.get('voice', {}).get('audio_key', '?'))
+                    import re as _re_strip
+                    response = _re_strip.sub(r'\[\[audio_as_voice\]\]\s*', '', response or '')
+                    response = _re_strip.sub(r'MEDIA:\S+', '', response).strip()
+                    if not response and voice_meta:
+                        response = "[voice]"
+                else:
+                    logger.info("[isles-voice] bridge upload failed, staying text-only")
+            # ── end isles-story voice bridge ──
+
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
 
