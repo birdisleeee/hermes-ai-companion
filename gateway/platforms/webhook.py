@@ -37,10 +37,12 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
 import time
+import uuid
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
 
@@ -53,6 +55,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.isles_turn_store import IslesTurnStore
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -63,6 +66,7 @@ from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
     WebhookRouteProcessor,
 )
+from gateway.reply_delivery import ReplyDeliveryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +187,19 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info: Dict[str, dict] = {}
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
+
+        # ── v4.2.19: isles-story voice bridge + turn delivery state ──
+        # Ported from giz v0.10.0 webhook.py for the isles-story (飞鸟群岛)
+        # http_callback delivery chain (scheme B).
+        self._pending_voice_meta: Optional[dict] = None
+        self._pending_reply_turns: Dict[str, dict] = {}
+        self._isles_turn_store = IslesTurnStore()
+        self._process_token = f"{os.getpid()}:{uuid.uuid4().hex}"
+        self._isles_retry_tasks: Dict[str, asyncio.Task] = {}
+        self._vr_meta_cache: Dict[str, dict] = {}
+        self._vr_meta_cache_ts: Dict[str, float] = {}
+        self._inner_note_cache: Dict[str, dict] = {}
+        self._inner_note_cache_ts: Dict[str, float] = {}
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
