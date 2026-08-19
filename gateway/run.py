@@ -14554,6 +14554,136 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except OSError:
                     pass
 
+    # ── v4.2.19: isles-story voice bridge (ported from giz v0.10.0) ──
+
+    @staticmethod
+    def is_isles_story_source(source) -> bool:
+        """Detect isles-story webhook events from SessionSource fields."""
+        if getattr(source, 'route', '') == 'isles-story':
+            return True
+        if getattr(source, 'user_name', '') == 'isles-story':
+            return True
+        if getattr(source, 'user_id', '') == 'webhook:isles-story':
+            return True
+        return False
+
+    @staticmethod
+    def _estimate_audio_duration(audio_path: str) -> int:
+        """Estimate audio duration in milliseconds from file size.
+
+        Fallback: 3000ms default if file cannot be read.
+        """
+        try:
+            size = os.path.getsize(audio_path)
+            # Rough estimate: 128kbps MP3 = ~16KB/s
+            return max(500, int(size / 16))
+        except OSError:
+            return 3000
+
+    async def _isles_voice_bridge_sync(self, text: str) -> Optional[dict]:
+        """Bridge existing audio (MEDIA: tag) to isles-story Worker.
+
+        Reads the .spoken.txt sidecar, uploads the audio, and returns
+        {voice: {...}, spoken_text?, transcript?} on success; None otherwise.
+        """
+        import re as _re
+
+        _media_match = _re.search(r'MEDIA:(\S+)', text)
+        if not _media_match:
+            logger.warning("[isles-voice] no MEDIA path found (unexpected)")
+            return None
+
+        _existing_path = _media_match.group(1).rstrip('",})\'')
+        if not os.path.isfile(_existing_path):
+            logger.warning("[isles-voice] audio file not found: %s", _existing_path)
+            return None
+
+        _spoken_path = _existing_path + ".spoken.txt"
+        _raw_text = ""
+        try:
+            with open(_spoken_path, "r") as _sf:
+                _raw_text = _sf.read()
+        except Exception:
+            pass  # fail-open: sidecar missing is OK
+
+        try:
+            upload_result = await self._isles_voice_upload(_existing_path)
+            _voice_meta = {
+                "voice": {
+                    "audio_key": upload_result["key"],
+                    "mime": upload_result["mime"],
+                    "duration_ms": self._estimate_audio_duration(_existing_path),
+                    "size": upload_result["size"],
+                },
+            }
+            if _raw_text.strip():
+                _voice_meta["spoken_text"] = _raw_text
+                _voice_meta["transcript"] = {
+                    "status": "ready",
+                    "text": _raw_text,
+                    "source": "tts_input",
+                }
+            return _voice_meta
+        except Exception as e:
+            logger.warning("[isles-voice] upload failed: %s", e)
+            return None
+        finally:
+            try:
+                if os.path.isfile(_spoken_path):
+                    os.remove(_spoken_path)
+            except Exception:
+                pass
+
+    async def _isles_voice_upload(self, audio_path: str) -> dict:
+        """Upload audio file to isles-story Worker with 10s timeout."""
+        import aiohttp
+
+        adapter = self.adapters.get(Platform.WEBHOOK)
+        if not adapter:
+            raise RuntimeError("Webhook adapter not found")
+
+        # TODO(方案B): token/url 来源需改造为从 isles_story route 配置拿，
+        # 而非硬编码 chat_id 读 _delivery_info。先保持 giz 原逻辑跑通。
+        chat_id = "webhook:isles-story:main"
+        delivery = adapter._delivery_info.get(chat_id, {})
+        token = delivery.get("deliver_extra", {}).get("token", "")
+        callback_url = delivery.get("deliver_extra", {}).get("url", "")
+
+        if not token or not callback_url:
+            raise RuntimeError("No isles-story token/URL in webhook delivery info")
+
+        base_url = callback_url.rsplit("/api/chat/callback", 1)[0]
+        upload_url = f"{base_url}/api/media/voice/upload"
+
+        if audio_path.endswith(".ogg"):
+            mime = "audio/ogg"
+        elif audio_path.endswith(".wav"):
+            mime = "audio/wav"
+        else:
+            mime = "audio/mpeg"
+
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                upload_url,
+                data=audio_data,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": mime,
+                },
+                timeout=aiohttp.ClientTimeout(total=10),  # UPLOAD_TIMEOUT
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Upload failed: HTTP {resp.status}")
+                result = await resp.json()
+                if not result.get("ok"):
+                    raise RuntimeError(f"Upload error: {result}")
+                return result
+
+    # ── end isles-story voice bridge ──
+
     async def _deliver_media_from_response(
         self,
         response: str,
