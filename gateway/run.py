@@ -14967,6 +14967,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
 
+            # Keep the real messaging platform key for display/runtime metadata;
+            # Isles uses a separate permission identity only for tool resolution.
+            platform_key = _platform_config_key(source.platform)
             enabled_toolsets = _resolve_enabled_toolsets_for_source(user_config, source)
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
@@ -19154,6 +19157,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._is_session_run_current(session_key, run_generation)
         
         user_config = _load_gateway_config()
+        # Display settings and the AIAgent platform field still use the real
+        # transport platform.  Only tool permissions use the trusted Isles key.
+        platform_key = _platform_config_key(source.platform)
         enabled_toolsets = _resolve_enabled_toolsets_for_source(user_config, source)
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
