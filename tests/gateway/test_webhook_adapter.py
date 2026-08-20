@@ -29,6 +29,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
+from gateway.isles_turn_store import IslesTurnStore
 from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
@@ -1294,6 +1295,110 @@ class TestSessionIsolation:
         assert len(captured_events) == 2
         ids = {ev.source.chat_id for ev in captured_events}
         assert len(ids) == 2, "Each delivery must have a unique session chat_id"
+
+    @pytest.mark.asyncio
+    async def test_http_callback_route_keeps_one_conversation_session(self, tmp_path):
+        """Conversational callbacks keep history across ordinary messages."""
+        routes = {
+            "isles-story": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message.content}",
+                "deliver": "http_callback",
+                "deliver_extra": {"url": "https://example.invalid/api/chat/callback"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter._isles_turn_store = IslesTurnStore(tmp_path / "turns")
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for delivery_id in ("msg-one", "msg-two"):
+                response = await cli.post(
+                    "/webhooks/isles-story",
+                    json={"message": {"content": delivery_id}},
+                    headers={"X-Request-ID": delivery_id},
+                )
+                assert response.status == 202
+
+        await asyncio.sleep(0.05)
+        assert [event.source.chat_id for event in captured_events] == [
+            "webhook:isles-story:main",
+            "webhook:isles-story:main",
+        ]
+        assert adapter._isles_turn_store.get("msg-one")["state"] == "accepted"
+        assert adapter._isles_turn_store.get("msg-two")["state"] == "accepted"
+
+        adapter._end_webhook_session = AsyncMock()
+        await adapter.on_processing_complete(captured_events[0], None)
+        adapter._end_webhook_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_shot_delivery_named_main_is_still_closed(self):
+        """Closure follows route mode, not a coincidental chat-id suffix."""
+        routes = {
+            "ci": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message.content}",
+                "deliver": "log",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/ci",
+                json={"message": {"content": "one shot"}},
+                headers={"X-Request-ID": "main"},
+            )
+            assert response.status == 202
+
+        await asyncio.sleep(0.05)
+        assert captured_events[0].source.chat_id == "webhook:ci:main"
+        adapter._end_webhook_session = AsyncMock()
+        await adapter.on_processing_complete(captured_events[0], None)
+        adapter._end_webhook_session.assert_awaited_once_with(
+            captured_events[0],
+            "webhook:ci:main",
+        )
+
+    @pytest.mark.asyncio
+    async def test_processing_status_carries_resolved_session_identity(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._isles_turn_store = IslesTurnStore(tmp_path / "turns")
+        adapter._isles_turn_store.receive(
+            "msg-status",
+            payload_sha256="a" * 64,
+            route="isles-story",
+            process_token=adapter._process_token,
+        )
+        adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+
+        await adapter.update_isles_turn_status(
+            "msg-status",
+            "processing",
+            session_id="session-after-reset",
+            session_is_new=True,
+        )
+
+        adapter._emit_isles_turn_status.assert_awaited_once_with(
+            "msg-status",
+            "processing",
+            retryable=False,
+            detail_code=None,
+            session_id="session-after-reset",
+            session_is_new=True,
+        )
 
 
 # ===================================================================

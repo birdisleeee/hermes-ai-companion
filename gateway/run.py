@@ -12264,6 +12264,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
+        # Isles needs the resolved Hermes information-window identity before
+        # the first reply arrives. The initial HTTP 202 is intentionally too
+        # early for this: session creation/reset/pinning happens in this
+        # handler. Emitting here lets the island reset only its context meter
+        # for a genuinely new session while leaving visible chat history alone.
+        await self._emit_isles_processing_status(
+            event,
+            session_entry=session_entry,
+            session_is_new=_is_new_session,
+        )
+
         # ── Turn lease (#64934) ────────────────────────────────────────
         # Session resolution is FINAL here (get_or_create → async-delegation
         # pinning → topic tip-walk switch_session are all above). Serialize
@@ -13483,6 +13494,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _context_window = build_context_window(
                     agent_result.get("last_prompt_tokens", 0),
                     agent_result.get("context_length", 0),
+                    # Compression may rotate the transcript during this turn.
+                    # session_entry has already been rebound above, so this is
+                    # the exact information window that produced the usage.
+                    session_id=session_entry.session_id,
                 )
                 webhook = self.adapters.get(event.source.platform)
                 if webhook and hasattr(webhook, "mark_pending_reply_turn"):
@@ -14602,6 +14617,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(source, 'user_id', '') == 'webhook:isles-story':
             return True
         return False
+
+    async def _emit_isles_processing_status(
+        self,
+        event: MessageEvent,
+        *,
+        session_entry: Any,
+        session_is_new: bool,
+    ) -> None:
+        """Tell Isles which resolved Hermes information window owns a turn."""
+        if not self.is_isles_story_source(event.source) or not event.message_id:
+            return
+        webhook = self.adapters.get(event.source.platform)
+        if not webhook or not hasattr(webhook, "update_isles_turn_status"):
+            return
+        await webhook.update_isles_turn_status(
+            event.message_id,
+            "processing",
+            session_id=session_entry.session_id,
+            session_is_new=session_is_new,
+        )
 
     @staticmethod
     def _estimate_audio_duration(audio_path: str) -> int:

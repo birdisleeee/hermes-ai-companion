@@ -286,6 +286,8 @@ class WebhookAdapter(BasePlatformAdapter):
         *,
         retryable: bool = False,
         detail_code: str | None = None,
+        session_id: str | None = None,
+        session_is_new: bool | None = None,
     ) -> None:
         """Persist and forward a real Agent lifecycle event to the Worker."""
         if not isinstance(turn_id, str) or not turn_id:
@@ -303,6 +305,8 @@ class WebhookAdapter(BasePlatformAdapter):
             status,
             retryable=retryable,
             detail_code=detail_code,
+            session_id=session_id,
+            session_is_new=session_is_new,
         )
 
     def _static_isles_delivery(self, route_name: str = "isles-story") -> dict:
@@ -320,6 +324,8 @@ class WebhookAdapter(BasePlatformAdapter):
         *,
         retryable: bool = False,
         detail_code: str | None = None,
+        session_id: str | None = None,
+        session_is_new: bool | None = None,
         route_name: str = "isles-story",
     ) -> bool:
         """Send metadata-only state; never create a visible chat message."""
@@ -343,6 +349,11 @@ class WebhookAdapter(BasePlatformAdapter):
         }
         if detail_code:
             payload["detail_code"] = detail_code
+        normalized_session_id = session_id.strip() if isinstance(session_id, str) else ""
+        if normalized_session_id:
+            payload["session_id"] = normalized_session_id
+        if session_is_new is not None:
+            payload["session_is_new"] = bool(session_is_new)
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -579,16 +590,12 @@ class WebhookAdapter(BasePlatformAdapter):
             # non-loopback bind. The escape hatch is for local testing only;
             # serving an unauthenticated route on a public interface is a
             # deployment-grade footgun we'd rather crash early than ship.
-            # giz customization: downgrade to warning so legacy INSECURE_NO_AUTH
-            # routes (isles-comment / isles-heartbeat-ephemeral) keep working on
-            # the public interface — preserves v0.10 behaviour. TODO: migrate
-            # these routes to real HMAC secrets + signed Worker calls.
             if secret == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
-                logger.warning(
+                raise ValueError(
                     f"[webhook] Route '{name}' uses INSECURE_NO_AUTH secret "
-                    f"bound to non-loopback host '{self._host}'. Insecure "
-                    f"(unauthenticated route on public interface); continuing "
-                    f"for backward compatibility. Consider setting a real secret."
+                    f"but is bound to non-loopback host '{self._host}'. "
+                    f"INSECURE_NO_AUTH is for local testing only. "
+                    f"Refusing to start to prevent accidental exposure."
                 )
             # deliver_only routes bypass the agent — the POST body becomes a
             # direct push notification via the configured delivery target.
@@ -1167,9 +1174,59 @@ class WebhookAdapter(BasePlatformAdapter):
         )
 
         # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
+        # Generic routes keep the in-memory TTL. Isles story additionally
+        # keeps a durable receipt so a process restart cannot turn an already
+        # accepted user message into an unsafe second Agent run.
         now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
+        is_durable_isles = (
+            route_name == "isles-story"
+            and route_config.get("deliver") == "http_callback"
+        )
+        durable_record = self._isles_turn_store.get(delivery_id) if is_durable_isles else None
+        payload_sha256 = self._isles_turn_store.payload_fingerprint(raw_body)
+        if durable_record and durable_record.get("payload_sha256") != payload_sha256:
+            return web.json_response(
+                {"status": "conflict", "delivery_id": delivery_id},
+                status=409,
+            )
+        retry_durable_turn = bool(
+            durable_record
+            and durable_record.get("retryable")
+            and durable_record.get("state") in {"interrupted", "processing_failed"}
+        )
+        if durable_record and durable_record.get("state") == "delivery_failed" and durable_record.get("outbox"):
+            self._schedule_isles_outbox_retry(delivery_id)
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                    "turn_status": "delivering",
+                    "duplicate": True,
+                },
+                status=202,
+            )
+        if durable_record and not retry_durable_turn:
+            durable_state = str(durable_record.get("state") or "accepted")
+            response_status = (
+                "accepted"
+                if durable_state not in {"interrupted", "processing_failed"}
+                else "failed"
+            )
+            return web.json_response(
+                {
+                    "status": response_status,
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                    "turn_status": durable_state,
+                    "retryable": bool(durable_record.get("retryable")),
+                    "duplicate": True,
+                },
+                status=202 if response_status == "accepted" else 409,
+            )
+        if not self._record_delivery_id(delivery_id, now) and not retry_durable_turn:
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
@@ -1177,6 +1234,21 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
             )
+        if is_durable_isles:
+            if durable_record:
+                self._isles_turn_store.transition(
+                    delivery_id,
+                    "accepted",
+                    retryable=False,
+                    process_token=self._process_token,
+                )
+            else:
+                self._isles_turn_store.receive(
+                    delivery_id,
+                    payload_sha256=payload_sha256,
+                    route=route_name,
+                    process_token=self._process_token,
+                )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
@@ -1236,9 +1308,14 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=502,
             )
 
-        # Use delivery_id in session key so concurrent webhooks on the
-        # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        # Conversational HTTP callbacks (including isles-story) deliberately
+        # keep one stable session per route so chat context survives ordinary
+        # messages. Non-conversational webhooks retain the official per-delivery
+        # isolation used for CI/events and other one-shot work.
+        if route_config.get("deliver") == "http_callback":
+            session_chat_id = f"webhook:{route_name}:main"
+        else:
+            session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
@@ -1281,11 +1358,11 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
-        # Non-blocking — return 202 Accepted immediately.  The per-delivery
-        # session is closed by the ``on_processing_complete`` override below
-        # once the agent run actually finishes (``handle_message`` itself is
-        # fire-and-forget: it spawns ``_process_message_background`` and
-        # returns before the run starts, so nothing can be closed here).
+        # Non-blocking — return 202 Accepted immediately. One-shot webhook
+        # sessions are closed by ``on_processing_complete`` once their Agent
+        # run finishes. Conversational http_callback sessions remain open for
+        # the next message (``handle_message`` itself is fire-and-forget: it
+        # spawns ``_process_message_background`` and returns before the run).
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
@@ -1303,16 +1380,19 @@ class WebhookAdapter(BasePlatformAdapter):
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
     ) -> None:
-        """Close the per-delivery webhook session once its run finishes.
+        """Close only a one-shot webhook session once its run finishes.
 
-        A webhook delivery is one-shot: the ``delivery_id`` is baked into the
-        session key, so the session will never receive a second turn.  Mirror
-        the cron completion path (``cron/scheduler.py`` →
-        ``end_session(..., "cron_complete")``) by marking the session ended
-        when the run completes.  Without this, webhook sessions keep
-        ``ended_at`` NULL forever; ``SessionDB.prune_sessions`` only reaps
-        rows with ``ended_at`` set, so unclosed webhook sessions accumulate
-        unbounded and drive state.db bloat (the ghost-session leak).
+        Non-http-callback routes bake ``delivery_id`` into the session key and
+        will never receive a second turn. Mirror the cron completion path
+        (``cron/scheduler.py`` → ``end_session(..., "cron_complete")``) by
+        marking those sessions ended when the run completes. Conversational
+        http_callback routes use a stable ``:main`` key and must stay open so
+        the next user message sees the same Agent information window.
+
+        Without closing the one-shot rows, webhook sessions keep ``ended_at``
+        NULL forever; ``SessionDB.prune_sessions`` only reaps rows with
+        ``ended_at`` set, so they accumulate and drive state.db bloat (the
+        ghost-session leak).
 
         This hook is the one seam that runs at the TRUE end of the run:
         ``BasePlatformAdapter._process_message_background`` fires it after the
@@ -1322,7 +1402,14 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        # Use route configuration rather than the chat-id suffix: a one-shot
+        # delivery is allowed to have the literal delivery id ``main`` and
+        # must still be closed.
+        chat_name = str(getattr(event.source, "chat_name", "") or "")
+        route_name = chat_name.removeprefix("webhook/")
+        route_config = self._routes.get(route_name, {})
+        if route_config.get("deliver") != "http_callback":
+            await self._end_webhook_session(event, event.source.chat_id)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str

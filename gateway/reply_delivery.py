@@ -236,10 +236,17 @@ def build_context_window(
     used_tokens: Any,
     limit_tokens: Any,
     *,
+    session_id: Any = None,
     measured_at: datetime | None = None,
     source: str = "provider_usage",
 ) -> dict[str, Any] | None:
-    """Normalize one actual prompt-window measurement."""
+    """Normalize one actual prompt-window measurement.
+
+    ``session_id`` binds the measurement to the information window that
+    produced it.  Callers that do not have a session id keep the legacy shape;
+    Isles callbacks always provide one so the Worker cannot carry a stale
+    reading across a session rotation.
+    """
 
     used = _positive_int(used_tokens)
     limit = _positive_int(limit_tokens)
@@ -252,7 +259,7 @@ def build_context_window(
     timestamp = timestamp.astimezone(timezone.utc)
 
     used_percent = max(0, min(100, round((used / limit) * 100)))
-    return {
+    context_window = {
         "used_tokens": used,
         "limit_tokens": limit,
         "remaining_tokens": max(0, limit - used),
@@ -261,11 +268,16 @@ def build_context_window(
         "measured_at": timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "source": source,
     }
+    normalized_session_id = session_id.strip() if isinstance(session_id, str) else ""
+    if normalized_session_id:
+        context_window["session_id"] = normalized_session_id
+    return context_window
 
 
 def extract_context_window(
     agent_or_compressor: Any,
     *,
+    session_id: Any = None,
     measured_at: datetime | None = None,
     source: str = "provider_usage",
 ) -> dict[str, Any] | None:
@@ -280,6 +292,7 @@ def extract_context_window(
     return build_context_window(
         getattr(compressor, "last_prompt_tokens", None),
         getattr(compressor, "context_length", None),
+        session_id=session_id,
         measured_at=measured_at,
         source=source,
     )
