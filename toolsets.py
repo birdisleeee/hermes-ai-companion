@@ -576,6 +576,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-isles-story": {
+        "description": "Flying Bird Islands trusted private chat toolset - full personal agent access",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],

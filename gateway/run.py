@@ -2514,6 +2514,32 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _toolset_platform_config_key_for_source(source: Any) -> str:
+    """Resolve the permission identity for a gateway message source.
+
+    Generic webhooks intentionally receive a minimal tool surface because their
+    payloads may contain untrusted third-party text. ``isles-story`` is a
+    separately authenticated private chat route, so it uses its own full-access
+    platform toolset without elevating comment, heartbeat, or future webhook
+    routes.
+    """
+    if getattr(source, "platform", None) == Platform.WEBHOOK:
+        if (
+            getattr(source, "route", "") == "isles-story"
+            or getattr(source, "user_id", "") == "webhook:isles-story"
+        ):
+            return "isles_story"
+    return _platform_config_key(source.platform)
+
+
+def _resolve_enabled_toolsets_for_source(user_config: dict, source: Any) -> list[str]:
+    """Return the actual toolsets an agent run receives for this source."""
+    from hermes_cli.tools_config import _get_platform_tools
+
+    platform_key = _toolset_platform_config_key_for_source(source)
+    return sorted(_get_platform_tools(user_config, platform_key))
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -14941,10 +14967,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
 
-            platform_key = _platform_config_key(source.platform)
-
-            from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = _resolve_enabled_toolsets_for_source(user_config, source)
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -19131,10 +19154,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._is_session_run_current(session_key, run_generation)
         
         user_config = _load_gateway_config()
-        platform_key = _platform_config_key(source.platform)
-
-        from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = _resolve_enabled_toolsets_for_source(user_config, source)
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
