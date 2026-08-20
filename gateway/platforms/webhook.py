@@ -579,12 +579,16 @@ class WebhookAdapter(BasePlatformAdapter):
             # non-loopback bind. The escape hatch is for local testing only;
             # serving an unauthenticated route on a public interface is a
             # deployment-grade footgun we'd rather crash early than ship.
+            # giz customization: downgrade to warning so legacy INSECURE_NO_AUTH
+            # routes (isles-comment / isles-heartbeat-ephemeral) keep working on
+            # the public interface — preserves v0.10 behaviour. TODO: migrate
+            # these routes to real HMAC secrets + signed Worker calls.
             if secret == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
-                raise ValueError(
+                logger.warning(
                     f"[webhook] Route '{name}' uses INSECURE_NO_AUTH secret "
-                    f"but is bound to non-loopback host '{self._host}'. "
-                    f"INSECURE_NO_AUTH is for local testing only. "
-                    f"Refusing to start to prevent accidental exposure."
+                    f"bound to non-loopback host '{self._host}'. Insecure "
+                    f"(unauthenticated route on public interface); continuing "
+                    f"for backward compatibility. Consider setting a real secret."
                 )
             # deliver_only routes bypass the agent — the POST body becomes a
             # direct push notification via the configured delivery target.
