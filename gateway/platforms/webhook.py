@@ -62,6 +62,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_image_from_url,
 )
 from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
@@ -113,6 +114,53 @@ DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
+_ISLES_IMAGE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+}
+
+
+def _validate_isles_media_items(payload: Any) -> list[tuple[str, str, str]]:
+    """Return trusted-shape image descriptors from an authenticated Isles turn."""
+    if not isinstance(payload, dict):
+        raise ValueError("invalid payload")
+    message_payload = payload.get("message", {})
+    if not isinstance(message_payload, dict):
+        raise ValueError("invalid message payload")
+    media_items = message_payload.get("media", [])
+    if media_items is None:
+        media_items = []
+    if not isinstance(media_items, list) or len(media_items) > 12:
+        raise ValueError("invalid media payload")
+    validated: list[tuple[str, str, str]] = []
+    for item in media_items:
+        if not isinstance(item, dict) or item.get("kind") != "image":
+            raise ValueError("invalid media item")
+        media_url = str(item.get("url") or "").strip()
+        media_mime = str(item.get("mime") or "image/jpeg").lower().strip()
+        extension = _ISLES_IMAGE_EXTENSIONS.get(media_mime)
+        if not media_url.startswith("https://") or extension is None:
+            raise ValueError("unsupported media item")
+        validated.append((media_url, media_mime, extension))
+    return validated
+
+
+async def _download_isles_media_items(
+    payload: Any,
+    downloader: Any = None,
+) -> tuple[list[str], list[str]]:
+    """Download authenticated Isles images before acknowledging the user turn."""
+    download = downloader or cache_image_from_url
+    paths: list[str] = []
+    media_types: list[str] = []
+    for media_url, media_mime, extension in _validate_isles_media_items(payload):
+        paths.append(await download(media_url, ext=extension))
+        media_types.append(media_mime)
+    return paths, media_types
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
 _LOOPBACK_HOSTS = frozenset({
@@ -310,10 +358,15 @@ class WebhookAdapter(BasePlatformAdapter):
         )
 
     def _static_isles_delivery(self, route_name: str = "isles-story") -> dict:
+        return self._delivery_config_for_route(route_name, {})
+
+    def _delivery_config_for_route(self, route_name: str, payload: dict) -> dict:
         route = self._routes.get(route_name, {})
         return {
             "deliver": route.get("deliver", "log"),
-            "deliver_extra": self._render_delivery_extra(route.get("deliver_extra", {}), {}),
+            "deliver_extra": self._render_delivery_extra(
+                route.get("deliver_extra", {}), payload
+            ),
             "reply_delivery": ReplyDeliveryConfig.from_route(route),
         }
 
@@ -1320,12 +1373,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
         # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
-        deliver_config = {
-            "deliver": route_config.get("deliver", "log"),
-            "deliver_extra": self._render_delivery_extra(
-                route_config.get("deliver_extra", {}), payload
-            ),
-        }
+        # Keep the route's validated reply policy with this accepted turn.
+        # Without it send() silently falls back to non-segmented delivery.
+        deliver_config = self._delivery_config_for_route(route_name, payload)
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
@@ -1341,12 +1391,49 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         if profile and isinstance(profile, str):
             source.profile = profile
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        if route_name == "isles-story":
+            try:
+                media_urls, media_types = await _download_isles_media_items(payload)
+            except ValueError as exc:
+                if is_durable_isles:
+                    self._isles_turn_store.transition(
+                        delivery_id,
+                        "processing_failed",
+                        retryable=True,
+                        detail_code="invalid_media",
+                        process_token=self._process_token,
+                    )
+                return web.json_response({"error": str(exc)}, status=400)
+            except Exception as exc:
+                logger.warning(
+                    "[webhook] Isles media download failed route=%s delivery=%s: %s",
+                    route_name,
+                    delivery_id,
+                    exc,
+                )
+                if is_durable_isles:
+                    self._isles_turn_store.transition(
+                        delivery_id,
+                        "processing_failed",
+                        retryable=True,
+                        detail_code="media_download_failed",
+                        process_token=self._process_token,
+                    )
+                return web.json_response(
+                    {"error": "Media download failed", "delivery_id": delivery_id},
+                    status=422,
+                )
+
         event = MessageEvent(
             text=prompt,
-            message_type=MessageType.TEXT,
+            message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
             source=source,
             raw_message=payload,
             message_id=delivery_id,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
         logger.info(

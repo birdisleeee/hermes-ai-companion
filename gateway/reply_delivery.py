@@ -41,7 +41,6 @@ class ReplyDeliveryConfig:
     require_user_turn_origin: bool = True
     short_reply_max: int = 90
     target_segment: int = 110
-    max_segments: int = 8
     min_delay_ms: int = 1200
     max_delay_ms: int = 3200
 
@@ -63,7 +62,6 @@ class ReplyDeliveryConfig:
             require_user_turn_origin=raw.get("require_user_turn_origin") is not False,
             short_reply_max=_bounded_int(raw.get("short_reply_max"), 90, 20, 500),
             target_segment=_bounded_int(raw.get("target_segment"), 110, 40, 1000),
-            max_segments=_bounded_int(raw.get("max_segments"), 8, 1, 8),
             min_delay_ms=min_delay,
             max_delay_ms=max_delay,
         )
@@ -105,7 +103,6 @@ def segment_reply(
     chunks = [_restore_protected(part, protected).strip() for part in chunks]
     chunks = [part for part in chunks if part]
     chunks = _merge_tiny_chunks(chunks, cfg.target_segment)
-    chunks = _limit_chunk_count(chunks, cfg.max_segments)
     return chunks or [text]
 
 
@@ -460,16 +457,3 @@ def _merge_tiny_chunks(chunks: list[str], target: int) -> list[str]:
             merged.append(chunk)
         index += 1
     return merged
-
-
-def _limit_chunk_count(chunks: list[str], maximum: int) -> list[str]:
-    limited = list(chunks)
-    while len(limited) > maximum:
-        pair_index = min(
-            range(len(limited) - 1),
-            key=lambda index: len(limited[index]) + len(limited[index + 1]),
-        )
-        limited[pair_index:pair_index + 2] = [
-            f"{limited[pair_index]}\n\n{limited[pair_index + 1]}"
-        ]
-    return limited

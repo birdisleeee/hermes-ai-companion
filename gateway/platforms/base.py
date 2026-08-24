@@ -698,6 +698,12 @@ def _looks_like_image(data: bytes) -> bool:
         return True
     if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
         return True
+    # HEIC/HEIF use the ISO Base Media File Format. The brand begins at byte
+    # 8 after the box size and ``ftyp`` marker.
+    if len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in {
+        b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1",
+    }:
+        return True
     return False
 
 
