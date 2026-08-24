@@ -266,6 +266,47 @@ class TestBusySessionAck:
         adapter._send_with_retry.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_isles_busy_text_preserves_each_worker_turn_as_fifo(self):
+        """Authenticated Isles deliveries must never merge distinct turn IDs."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "queue"
+        runner._queued_events = {}
+        adapter = _make_adapter(platform_val="webhook")
+
+        source = SessionSource(
+            platform=Platform.WEBHOOK,
+            chat_id="webhook:isles-story:main",
+            chat_name="webhook/isles-story",
+            chat_type="private",
+            user_id="isles-story",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+
+        events = [
+            MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=message_id,
+            )
+            for message_id, text in (("msg-isles-1", "first"), ("msg-isles-2", "second"))
+        ]
+
+        assert await runner._handle_active_session_busy_message(events[0], sk) is True
+        assert await runner._handle_active_session_busy_message(events[1], sk) is True
+
+        assert adapter._pending_messages[sk].message_id == "msg-isles-1"
+        assert [event.message_id for event in runner._queued_events[sk]] == ["msg-isles-2"]
+        assert adapter._pending_messages[sk].text == "first"
+        assert runner._queued_events[sk][0].text == "second"
+        agent.interrupt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self, monkeypatch):
         """busy_input_mode='steer' injects via agent.steer() and skips queueing."""
         import gateway.run as _gr

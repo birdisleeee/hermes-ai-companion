@@ -61,6 +61,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     cache_image_from_url,
 )
@@ -415,7 +416,15 @@ class WebhookAdapter(BasePlatformAdapter):
                     json=payload,
                     headers={"Authorization": f"Bearer {token}"},
                 ) as response:
-                    return 200 <= response.status < 300
+                    delivered = 200 <= response.status < 300
+                    if not delivered:
+                        logger.warning(
+                            "[webhook] turn status rejected status=%s http=%s turn=%s",
+                            status,
+                            response.status,
+                            hashlib.sha256(turn_id.encode()).hexdigest()[:8],
+                        )
+                    return delivered
         except Exception as error:
             logger.warning(
                 "[webhook] turn status delivery failed status=%s type=%s turn=%s",
@@ -1495,6 +1504,36 @@ class WebhookAdapter(BasePlatformAdapter):
         chat_name = str(getattr(event.source, "chat_name", "") or "")
         route_name = chat_name.removeprefix("webhook/")
         route_config = self._routes.get(route_name, {})
+        if route_config.get("deliver") == "http_callback" and route_name == "isles-story":
+            turn_id = str(getattr(event, "message_id", "") or "")
+            if not turn_id:
+                return
+            record = self._isles_turn_store.get(turn_id) or {}
+            state = str(record.get("state") or "")
+            if outcome == ProcessingOutcome.SUCCESS and state != "completed":
+                # Intentional-silence turns have no visible callback, but they
+                # are still terminal. Do not leave the Worker/UI in processing.
+                self._pending_reply_turns.pop(turn_id, None)
+                await self.update_isles_turn_status(turn_id, "completed")
+            elif outcome == ProcessingOutcome.CANCELLED and state != "completed":
+                self._pending_reply_turns.pop(turn_id, None)
+                await self.update_isles_turn_status(
+                    turn_id,
+                    "interrupted",
+                    retryable=True,
+                    detail_code="processing_cancelled",
+                )
+            elif outcome == ProcessingOutcome.FAILURE and state not in {
+                "completed", "delivery_failed", "processing_failed"
+            }:
+                self._pending_reply_turns.pop(turn_id, None)
+                await self.update_isles_turn_status(
+                    turn_id,
+                    "failed",
+                    retryable=True,
+                    detail_code="processing_failed",
+                )
+            return
         if route_config.get("deliver") != "http_callback":
             await self._end_webhook_session(event, event.source.chat_id)
 

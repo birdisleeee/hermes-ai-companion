@@ -5882,10 +5882,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         effective_mode = self._busy_input_mode
         busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
+        source_platform = getattr(event.source.platform, "value", event.source.platform)
+        source_chat_name = str(getattr(event.source, "chat_name", "") or "")
+        is_isles_story_turn = (
+            str(source_platform or "").lower() == "webhook"
+            and source_chat_name == "webhook/isles-story"
+        )
         if (
             event.message_type == MessageType.TEXT
             and busy_text_mode == "queue"
             and effective_mode != "steer"
+            and not is_isles_story_turn
         ):
             return False
 
@@ -5959,6 +5966,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # merge semantics for media.
         if not steered:
             self._queue_or_replace_pending_event(session_key, event)
+
+        if is_isles_story_turn:
+            # Isles persists one Worker turn (and one UI activity marker) per
+            # inbound delivery ID. Generic busy-text debounce merges bodies
+            # and keeps only one message ID, which strands the other turn in
+            # processing. Preserve every delivery as a FIFO Agent turn.
+            # The island UI already renders accepted/processing state, so do
+            # not emit the generic busy acknowledgment: before an Agent result
+            # exists it has no delivery binding and the Worker must reject it.
+            logger.info(
+                "Queued Isles follow-up as an independent FIFO turn for session %s",
+                session_key,
+            )
+            return True
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"

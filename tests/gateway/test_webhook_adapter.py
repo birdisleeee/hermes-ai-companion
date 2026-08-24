@@ -30,12 +30,13 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
 from gateway.isles_turn_store import IslesTurnStore
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
     _INSECURE_NO_AUTH,
     check_webhook_requirements,
 )
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -1336,6 +1337,106 @@ class TestSessionIsolation:
         adapter._end_webhook_session = AsyncMock()
         await adapter.on_processing_complete(captured_events[0], None)
         adapter._end_webhook_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome", "expected_status", "expected_detail"),
+        [
+            (ProcessingOutcome.SUCCESS, "completed", None),
+            (ProcessingOutcome.FAILURE, "failed", "processing_failed"),
+            (ProcessingOutcome.CANCELLED, "interrupted", "processing_cancelled"),
+        ],
+    )
+    async def test_isles_turn_always_gets_terminal_status(
+        self, tmp_path, outcome, expected_status, expected_detail
+    ):
+        routes = {
+            "isles-story": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message.content}",
+                "deliver": "http_callback",
+                "deliver_extra": {"url": "https://example.invalid/api/chat/callback"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter._isles_turn_store = IslesTurnStore(tmp_path / "turns")
+        adapter._isles_turn_store.receive(
+            "msg-terminal",
+            payload_sha256="a" * 64,
+            route="isles-story",
+            process_token=adapter._process_token,
+        )
+        adapter._isles_turn_store.transition(
+            "msg-terminal",
+            "processing",
+            process_token=adapter._process_token,
+        )
+        adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.WEBHOOK,
+                user_id="webhook:isles-story",
+                chat_id="webhook:isles-story:main",
+                chat_name="webhook/isles-story",
+            ),
+            message_id="msg-terminal",
+        )
+
+        await adapter.on_processing_complete(event, outcome)
+
+        record = adapter._isles_turn_store.get("msg-terminal")
+        expected_state = "processing_failed" if expected_status == "failed" else expected_status
+        assert record["state"] == expected_state
+        adapter._emit_isles_turn_status.assert_awaited_once_with(
+            "msg-terminal",
+            expected_status,
+            retryable=outcome != ProcessingOutcome.SUCCESS,
+            detail_code=expected_detail,
+            session_id=None,
+            session_is_new=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_isles_completed_delivery_does_not_emit_duplicate_terminal_status(self, tmp_path):
+        routes = {
+            "isles-story": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message.content}",
+                "deliver": "http_callback",
+                "deliver_extra": {"url": "https://example.invalid/api/chat/callback"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter._isles_turn_store = IslesTurnStore(tmp_path / "turns")
+        adapter._isles_turn_store.receive(
+            "msg-completed",
+            payload_sha256="b" * 64,
+            route="isles-story",
+            process_token=adapter._process_token,
+        )
+        adapter._isles_turn_store.transition(
+            "msg-completed",
+            "completed",
+            process_token=adapter._process_token,
+        )
+        adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.WEBHOOK,
+                user_id="webhook:isles-story",
+                chat_id="webhook:isles-story:main",
+                chat_name="webhook/isles-story",
+            ),
+            message_id="msg-completed",
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        adapter._emit_isles_turn_status.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_one_shot_delivery_named_main_is_still_closed(self):
