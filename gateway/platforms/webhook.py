@@ -257,6 +257,10 @@ class WebhookAdapter(BasePlatformAdapter):
         self._vr_meta_cache_ts: Dict[str, float] = {}
         self._inner_note_cache: Dict[str, dict] = {}
         self._inner_note_cache_ts: Dict[str, float] = {}
+        # Interactive approvals for the private isles-story route.  The map
+        # binds an opaque approval ID to the exact gateway session so a button
+        # can never release a different concurrent approval by FIFO accident.
+        self._isles_approval_states: Dict[str, dict] = {}
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -630,6 +634,118 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] http_callback failed: %s", e)
             return SendResult(success=False, error=str(e))
 
+    @staticmethod
+    def _isles_system_event_url(delivery: dict) -> str:
+        callback_url = str(delivery.get("deliver_extra", {}).get("url") or "")
+        if "/api/chat/callback" not in callback_url:
+            return ""
+        return callback_url.rsplit("/api/chat/callback", 1)[0] + "/api/chat/system-event"
+
+    def _prune_isles_approval_states(self, now: float) -> None:
+        stale = []
+        for approval_id, state in self._isles_approval_states.items():
+            expires_at = float(state.get("expires_at") or 0)
+            terminal_at = float(state.get("terminal_at") or 0)
+            if terminal_at and now - terminal_at > 3600:
+                stale.append(approval_id)
+            elif not terminal_at and expires_at and now - expires_at > 3600:
+                stale.append(approval_id)
+        for approval_id in stale:
+            self._isles_approval_states.pop(approval_id, None)
+
+    async def _deliver_isles_system_event(
+        self, payload: dict, delivery: dict
+    ) -> SendResult:
+        """Deliver one out-of-band event without forging a final turn reply."""
+        import aiohttp
+
+        url = self._isles_system_event_url(delivery)
+        token = str(delivery.get("deliver_extra", {}).get("token") or "")
+        if not url or not token:
+            return SendResult(success=False, error="Missing Isles system-event callback")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "hermes-webhook/1.0",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if 200 <= response.status < 300:
+                        return SendResult(success=True)
+                    logger.warning(
+                        "[webhook] isles system event rejected http=%s kind=%s",
+                        response.status,
+                        str(payload.get("kind") or "unknown")[:32],
+                    )
+                    return SendResult(
+                        success=False,
+                        error=f"HTTP {response.status}",
+                        retryable=response.status >= 500,
+                    )
+        except Exception as error:
+            logger.warning(
+                "[webhook] isles system event delivery failed type=%s",
+                type(error).__name__,
+            )
+            return SendResult(success=False, error=str(error), retryable=True)
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        """Render an Isles approval as a structured, exact-ID system event."""
+        if chat_id != "webhook:isles-story:main":
+            return SendResult(success=False, error="Unsupported webhook approval surface")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        approval_id = str(metadata.get("_isles_approval_id") or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", approval_id):
+            return SendResult(success=False, error="Missing approval ID")
+        timeout_seconds = max(int(metadata.get("_isles_approval_timeout_seconds") or 0), 0)
+        expires_at = float(metadata.get("_isles_approval_expires_at") or 0)
+        if expires_at <= time.time():
+            expires_at = time.time() + timeout_seconds
+        choices = ["once"]
+        if allow_permanent:
+            choices.append("always")
+        choices.append("deny")
+        self._prune_isles_approval_states(time.time())
+        self._isles_approval_states[approval_id] = {
+            "session_key": session_key,
+            "expires_at": expires_at,
+            "choices": tuple(choices),
+            "status": "pending",
+        }
+        delivery = self._delivery_info.get(chat_id) or self._static_isles_delivery()
+        payload = {
+            "protocol": "isles-system-event-v1",
+            "event_id": approval_id,
+            "kind": "approval",
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "approval": {
+                "approval_id": approval_id,
+                "title": "命令执行审批",
+                "command": command,
+                "description": description,
+                "timeout_seconds": timeout_seconds,
+                "expires_at": expires_at,
+                "choices": choices,
+                "status": "pending",
+                "smart_denied": bool(smart_denied),
+            },
+        }
+        return await self._deliver_isles_system_event(payload, delivery)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -677,6 +793,10 @@ class WebhookAdapter(BasePlatformAdapter):
         # Content-Length and would otherwise bypass the header check below.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_post(
+            "/webhooks/isles-story/approval",
+            self._handle_isles_approval_action,
+        )
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
         # routes the inbound event to that profile. Same handler; the profile is
@@ -756,6 +876,8 @@ class WebhookAdapter(BasePlatformAdapter):
         to the ``log`` deliver type.  TTL cleanup happens on POST.
         """
         delivery = self._delivery_info.get(chat_id, {})
+        if chat_id == "webhook:isles-story:main" and not delivery:
+            delivery = self._static_isles_delivery()
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
@@ -766,6 +888,28 @@ class WebhookAdapter(BasePlatformAdapter):
             return await self._deliver_github_comment(content, delivery)
 
         if deliver_type == "http_callback":
+            _turn_marker = (
+                self._pending_reply_turns.get(reply_to)
+                if isinstance(reply_to, str) and reply_to
+                else None
+            )
+            if chat_id == "webhook:isles-story:main" and _turn_marker is None:
+                event_metadata = metadata if isinstance(metadata, dict) else {}
+                event_id = str(event_metadata.get("_isles_system_event_id") or "")
+                if not re.fullmatch(r"[a-f0-9]{32}", event_id):
+                    event_id = uuid.uuid4().hex
+                    event_metadata["_isles_system_event_id"] = event_id
+                return await self._deliver_isles_system_event(
+                    {
+                        "protocol": "isles-system-event-v1",
+                        "event_id": event_id,
+                        "kind": "notice",
+                        "title": "系统提示",
+                        "body": content,
+                        "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    },
+                    delivery,
+                )
             # ── v4.2.19: isles-story delivery (ported from giz) ──
             # _combined_meta: voice injection only for now (VR/inner_note → fp7)
             _combined_meta: Dict[str, Any] = {}
@@ -773,11 +917,6 @@ class WebhookAdapter(BasePlatformAdapter):
             if _voice_meta is not None:
                 _combined_meta.update(_voice_meta)
 
-            _turn_marker = (
-                self._pending_reply_turns.get(reply_to)
-                if isinstance(reply_to, str) and reply_to
-                else None
-            )
             if _turn_marker is not None:
                 _reply_config = delivery.get("reply_delivery")
                 if not isinstance(_reply_config, ReplyDeliveryConfig):
@@ -937,6 +1076,88 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # HTTP handlers
     # ------------------------------------------------------------------
+
+    async def _handle_isles_approval_action(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Resolve one exact Isles approval via replay-protected Worker HMAC."""
+        route = self._routes.get("isles-story", {})
+        secret = str(route.get("secret", self._global_secret) or "")
+        if not secret or secret == _INSECURE_NO_AUTH:
+            return web.json_response({"error": "Approval route unavailable"}, status=503)
+        content_length = request.content_length or 0
+        if content_length > 16 * 1024:
+            return web.json_response({"error": "Payload too large"}, status=413)
+        try:
+            raw_body = await request.read()
+        except Exception:
+            return web.json_response({"error": "Bad request"}, status=400)
+        if len(raw_body) > 16 * 1024:
+            return web.json_response({"error": "Payload too large"}, status=413)
+        # State-changing approval actions require timestamp-bound V2 only.
+        if not request.headers.get("X-Webhook-Signature-V2", ""):
+            return web.json_response({"error": "V2 signature required"}, status=401)
+        if not self._validate_signature(request, raw_body, secret):
+            return web.json_response({"error": "Invalid signature"}, status=401)
+        try:
+            payload = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        if not isinstance(payload, dict) or payload.get("protocol") != "isles-approval-action-v1":
+            return web.json_response({"error": "Invalid protocol"}, status=400)
+        approval_id = str(payload.get("approval_id") or "")
+        choice = str(payload.get("choice") or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", approval_id) or choice not in {"once", "always", "deny"}:
+            return web.json_response({"error": "Invalid approval action"}, status=400)
+
+        now = time.time()
+        self._prune_isles_approval_states(now)
+        state = self._isles_approval_states.get(approval_id)
+        if not state:
+            return web.json_response({"error": "Approval not active"}, status=404)
+        if state.get("status") != "pending":
+            return web.json_response({
+                "ok": True,
+                "approval_id": approval_id,
+                "status": state.get("status"),
+                "duplicate": True,
+            })
+        if now >= float(state.get("expires_at") or 0):
+            state.update(status="expired", terminal_at=now)
+            return web.json_response({
+                "ok": False,
+                "approval_id": approval_id,
+                "status": "expired",
+            }, status=410)
+        if choice not in set(state.get("choices") or ()):
+            return web.json_response({"error": "Choice not allowed"}, status=403)
+
+        from tools.approval import resolve_gateway_approval
+
+        resolved = resolve_gateway_approval(
+            str(state.get("session_key") or ""),
+            choice,
+            approval_id=approval_id,
+        )
+        if resolved != 1:
+            state.update(status="expired", terminal_at=now)
+            return web.json_response({
+                "ok": False,
+                "approval_id": approval_id,
+                "status": "expired",
+            }, status=409)
+        terminal_status = {
+            "once": "approved_once",
+            "always": "approved_always",
+            "deny": "denied",
+        }[choice]
+        state.update(status=terminal_status, terminal_at=now)
+        return web.json_response({
+            "ok": True,
+            "approval_id": approval_id,
+            "status": terminal_status,
+            "duplicate": False,
+        })
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""

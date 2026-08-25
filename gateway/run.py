@@ -19276,10 +19276,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _phrase_err:
                 logger.debug("generic status phrase selection failed: %s", _phrase_err)
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
-        # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
+        # Generic webhooks remain log-only.  The authenticated private
+        # isles-story route has a dedicated system-event surface, so its
+        # progress and interim notices can be delivered without pretending
+        # they are final turn replies.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        _is_isles_story_webhook = (
+            source.platform == Platform.WEBHOOK
+            and (
+                getattr(source, "route", "") == "isles-story"
+                or getattr(source, "user_id", "") == "webhook:isles-story"
+            )
+        )
+        tool_progress_enabled = (
+            progress_mode not in {"off", "log"}
+            and (source.platform != Platform.WEBHOOK or _is_isles_story_webhook)
+        )
         # Live working-state status for text-rendering typing indicators
         # (Slack's assistant status line). Independent of tool_progress —
         # Slack defaults tool_progress off (permanent lines spam channels)
@@ -19308,7 +19320,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
+            (source.platform != Platform.WEBHOOK or _is_isles_story_webhook)
             and interim_assistant_messages_mode != "off"
         )
         # thinking_progress is independent — if enabled, we need the progress
@@ -20907,13 +20919,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        _approval_metadata = (
+                            dict(_status_thread_metadata)
+                            if isinstance(_status_thread_metadata, dict)
+                            else {}
+                        )
+                        _approval_metadata.update({
+                            "_isles_approval_id": approval_data.get("approval_id", ""),
+                            "_isles_approval_timeout_seconds": approval_data.get("timeout_seconds", 0),
+                            "_isles_approval_expires_at": approval_data.get("expires_at", 0),
+                        })
                         _approval_fut = safe_schedule_threadsafe(
                             _status_adapter.send_exec_approval(
                                 chat_id=_status_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_metadata,
                                 allow_permanent=approval_data.get("allow_permanent", True),
                                 smart_denied=approval_data.get("smart_denied", False),
                             ),
