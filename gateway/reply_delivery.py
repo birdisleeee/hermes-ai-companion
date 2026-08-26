@@ -351,17 +351,13 @@ def _valid_turn_id(turn_id: str) -> str:
 
 
 def _split_on_hard_marker(masked: str, marker: str) -> list[str]:
-    """Split on lines consisting solely of the configured marker token."""
-    pieces: list[str] = []
-    current: list[str] = []
-    for line in masked.split("\n"):
-        if line.strip() == marker:
-            pieces.append("\n".join(current))
-            current = []
-        else:
-            current.append(line)
-    pieces.append("\n".join(current))
-    return pieces
+    """Split on the literal marker token wherever it appears in unmasked text.
+
+    ``masked`` already has protected spans (code blocks, links, URLs) replaced
+    by placeholders, so an inline marker such as ``第一句[[SPLIT]]第二句`` is
+    treated as a hard boundary while markers inside protected spans are ignored.
+    """
+    return masked.split(marker)
 
 
 def _mask_protected_spans(text: str) -> tuple[str, Sequence[str]]:

@@ -100,6 +100,12 @@ def test_hard_split_marker_splits_reply_on_own_line() -> None:
     assert segment_reply(content, config) == ["今天天气不错", "你那边怎么样？"]
 
 
+def test_hard_split_marker_splits_inline() -> None:
+    config = ReplyDeliveryConfig(segmented=True, hard_split_marker="[[SPLIT]]")
+    content = "这是第一句[[SPLIT]]这是第二句[[SPLIT]]这是第三句"
+    assert segment_reply(content, config) == ["这是第一句", "这是第二句", "这是第三句"]
+
+
 def test_hard_split_marker_ignored_inside_code_block() -> None:
     config = ReplyDeliveryConfig(segmented=True, hard_split_marker="[[SPLIT]]")
     content = "看这段：\n```\n[[SPLIT]]\n```\n\n上面是代码。"
