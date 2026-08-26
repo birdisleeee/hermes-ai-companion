@@ -92,3 +92,41 @@ def test_accepted_turn_keeps_enabled_segment_delivery_policy() -> None:
     delivery = adapter._delivery_config_for_route("isles-story", {})
     assert delivery["reply_delivery"].segmented is True
     assert delivery["reply_delivery"].target_segment == 180
+
+
+def test_hard_split_marker_splits_reply_on_own_line() -> None:
+    config = ReplyDeliveryConfig(segmented=True, hard_split_marker="[[SPLIT]]")
+    content = "今天天气不错\n\n[[SPLIT]]\n\n你那边怎么样？"
+    assert segment_reply(content, config) == ["今天天气不错", "你那边怎么样？"]
+
+
+def test_hard_split_marker_ignored_inside_code_block() -> None:
+    config = ReplyDeliveryConfig(segmented=True, hard_split_marker="[[SPLIT]]")
+    content = "看这段：\n```\n[[SPLIT]]\n```\n\n上面是代码。"
+    assert segment_reply(content, config) == [content]
+
+
+def test_hard_split_marker_disabled_by_default() -> None:
+    config = ReplyDeliveryConfig(segmented=True)
+    content = "今天天气不错\n\n[[SPLIT]]\n\n你那边怎么样？"
+    assert "[[SPLIT]]" in "\n\n".join(segment_reply(content, config))
+
+
+def test_hard_split_marker_respected_for_short_reply() -> None:
+    config = ReplyDeliveryConfig(segmented=True, short_reply_max=90, hard_split_marker="[[SPLIT]]")
+    content = "你好\n\n[[SPLIT]]\n\n我也想你"
+    assert segment_reply(content, config) == ["你好", "我也想你"]
+
+
+def test_route_config_reads_hard_split_marker() -> None:
+    config = ReplyDeliveryConfig.from_route(
+        {"reply_delivery": {"segmented": True, "hard_split_marker": "[[SPLIT]]"}}
+    )
+    assert config.hard_split_marker == "[[SPLIT]]"
+
+
+def test_route_config_rejects_multiline_marker() -> None:
+    config = ReplyDeliveryConfig.from_route(
+        {"reply_delivery": {"segmented": True, "hard_split_marker": "a\nb"}}
+    )
+    assert config.hard_split_marker == ""

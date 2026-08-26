@@ -41,6 +41,7 @@ class ReplyDeliveryConfig:
     require_user_turn_origin: bool = True
     short_reply_max: int = 90
     target_segment: int = 110
+    hard_split_marker: str = ""
     min_delay_ms: int = 1200
     max_delay_ms: int = 3200
 
@@ -62,6 +63,7 @@ class ReplyDeliveryConfig:
             require_user_turn_origin=raw.get("require_user_turn_origin") is not False,
             short_reply_max=_bounded_int(raw.get("short_reply_max"), 90, 20, 500),
             target_segment=_bounded_int(raw.get("target_segment"), 110, 40, 1000),
+            hard_split_marker=_clean_marker(raw.get("hard_split_marker")),
             min_delay_ms=min_delay,
             max_delay_ms=max_delay,
         )
@@ -90,10 +92,18 @@ def segment_reply(
     text = content.strip() if isinstance(content, str) else ""
     if not text:
         return []
+
+    masked, protected = _mask_protected_spans(text)
+    if cfg.hard_split_marker and cfg.hard_split_marker in masked:
+        parts = _split_on_hard_marker(masked, cfg.hard_split_marker)
+        parts = [_restore_protected(part, protected).strip() for part in parts]
+        parts = [part for part in parts if part]
+        if parts:
+            return parts
+
     if len(text) <= cfg.short_reply_max:
         return [text]
 
-    masked, protected = _mask_protected_spans(text)
     paragraphs = [part.strip() for part in _PARAGRAPH_BREAK_RE.split(masked) if part.strip()]
     chunks: list[str] = []
     for paragraph in paragraphs:
@@ -305,6 +315,22 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
+def _clean_marker(value: Any) -> str:
+    """Normalize an explicit hard-split marker from route config.
+
+    The marker must be a short single-line token.  Empty, multi-line, or
+    oversized values disable the feature so an accidental config cannot split
+    every reply.
+    """
+
+    if not isinstance(value, str):
+        return ""
+    marker = value.strip()
+    if not marker or len(marker) > 64 or "\n" in marker or "\r" in marker:
+        return ""
+    return marker
+
+
 def _positive_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -322,6 +348,20 @@ def _valid_turn_id(turn_id: str) -> str:
     if not normalized or len(normalized) > 200 or any(ch.isspace() for ch in normalized):
         raise ValueError("turn_id must be non-empty, whitespace-free, and at most 200 characters")
     return normalized
+
+
+def _split_on_hard_marker(masked: str, marker: str) -> list[str]:
+    """Split on lines consisting solely of the configured marker token."""
+    pieces: list[str] = []
+    current: list[str] = []
+    for line in masked.split("\n"):
+        if line.strip() == marker:
+            pieces.append("\n".join(current))
+            current = []
+        else:
+            current.append(line)
+    pieces.append("\n".join(current))
+    return pieces
 
 
 def _mask_protected_spans(text: str) -> tuple[str, Sequence[str]]:
