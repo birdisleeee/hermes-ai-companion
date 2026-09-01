@@ -1,5 +1,6 @@
 """Permission boundary tests for the trusted Flying Bird Islands chat route."""
 
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -123,7 +124,7 @@ def test_isles_story_can_be_explicitly_scoped_without_changing_webhook():
 async def test_isles_story_complete_agent_path_keeps_transport_platform_key(
     monkeypatch, tmp_path
 ):
-    """Run the real gateway path far enough to catch dangling platform locals."""
+    """Run the real gateway path and keep its structured sticker reply plan."""
     from gateway.session import SessionSource
     from tests.gateway.test_run_cleanup_progress import (
         CleanupCaptureAdapter,
@@ -134,10 +135,56 @@ async def test_isles_story_complete_agent_path_keeps_transport_platform_key(
 
     captured = {}
 
+    class CandidateResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "ok": True,
+                "candidate_token": "ab" * 16,
+                "catalog_version": "test-2026-09-01.1",
+                "candidates": [{
+                    "sticker_id": "giz_comfort_headpat_01",
+                    "label": "摸摸头",
+                    "meaning": "温柔安慰",
+                    "emotions": ["心疼"],
+                    "tones": ["温柔"],
+                    "scenarios": ["安慰对方"],
+                    "intensity": 2,
+                    "fallback_text": "摸摸你。",
+                }],
+            }).encode()
+
     class IslesAgent(ProgressAgent):
         def __init__(self, **kwargs):
             captured.update(kwargs)
             super().__init__(**kwargs)
+
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            from tools.isles_sticker_tool import (
+                compose_isles_reply,
+                search_isles_stickers,
+            )
+
+            search_isles_stickers({
+                "intent": "安慰对方",
+                "emotion": "心疼",
+                "tone": "温柔",
+            })
+            composed = json.loads(compose_isles_reply({"actions": [
+                {"type": "text", "content": "宝宝"},
+                {"type": "sticker", "sticker_id": "giz_comfort_headpat_01"},
+            ]}))
+            assert composed == {
+                "ok": True,
+                "accepted": 2,
+                "instruction": "回复计划已保存。不要再输出额外正文；结束当前回答即可",
+            }
+            return {"final_response": "宝宝", "messages": [], "api_calls": 2}
 
     adapter = CleanupCaptureAdapter(platform=Platform.WEBHOOK)
     adapter._delivery_info = {
@@ -151,6 +198,10 @@ async def test_isles_story_complete_agent_path_keeps_transport_platform_key(
     runner = _make_runner(adapter)
     gateway_run = _install_fakes(monkeypatch, IslesAgent, cleanup_on=False)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        "tools.isles_sticker_tool.urlopen",
+        lambda *_args, **_kwargs: CandidateResponse(),
+    )
 
     source = SessionSource(
         platform=Platform.WEBHOOK,
@@ -171,7 +222,11 @@ async def test_isles_story_complete_agent_path_keeps_transport_platform_key(
         event_message_id="turn-isles-001",
     )
 
-    assert result["final_response"] == "done"
+    assert result["final_response"] == "宝宝"
+    assert [action["type"] for action in result["isles_reply_plan"]] == [
+        "text",
+        "sticker",
+    ]
     assert captured["platform"] == "webhook"
     assert {"file", "memory", "tts"} <= set(captured["enabled_toolsets"])
 

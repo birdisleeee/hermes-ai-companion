@@ -21507,6 +21507,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "model": _resolved_model,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
+                # Preserve the structured Isles reply plan captured inside the
+                # agent turn scope.  Without this pass-through the outer
+                # delivery layer only sees ``final_response`` and silently
+                # falls back to the model's trailing plain text.
+                "isles_reply_plan": result.get("isles_reply_plan"),
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
                 # Pass through the agent_persisted flag so the persistence block
