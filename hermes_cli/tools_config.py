@@ -118,6 +118,7 @@ CONFIGURABLE_TOOLSETS = [
     ("discord_admin",   "🛡️  Discord Server Admin",    "list channels/roles, pin, assign roles"),
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
     ("computer_use",     "🖱️  Computer Use (macOS/Windows/Linux)", "background desktop control via cua-driver"),
+    ("isles_stickers",   "🖼️  Flying Bird Islands Stickers", "trusted intent search and one-sticker reply planning"),
 ]
 
 
@@ -190,6 +191,7 @@ def _xai_credentials_present() -> bool:
 _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
     "discord": {"discord"},
     "discord_admin": {"discord"},
+    "isles_stickers": {"isles_story"},
 }
 
 

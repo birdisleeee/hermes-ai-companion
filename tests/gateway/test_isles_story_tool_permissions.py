@@ -58,6 +58,8 @@ def test_generic_webhook_routes_remain_sandboxed():
         "vision_analyze",
         "clarify",
     }
+    assert "search_isles_stickers" not in _resolved_tools("webhook")
+    assert "compose_isles_reply" not in _resolved_tools("webhook")
 
 
 def test_payload_style_user_name_cannot_elevate_another_webhook_route():
@@ -88,7 +90,17 @@ def test_isles_story_default_contains_full_memory_and_expression_tools():
         "session_search",
         "execute_code",
         "delegate_task",
+        "search_isles_stickers",
+        "compose_isles_reply",
     } <= tools
+
+
+def test_xiaochu_route_does_not_receive_giz_sticker_tools():
+    tools = _resolved_source_tools(
+        _source(route="isles-xiaochu", user_id="webhook:isles-xiaochu")
+    )
+    assert "search_isles_stickers" not in tools
+    assert "compose_isles_reply" not in tools
 
 
 def test_isles_story_can_be_explicitly_scoped_without_changing_webhook():

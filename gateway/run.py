@@ -13023,6 +13023,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            _isles_reply_plan = (
+                agent_result.get("isles_reply_plan")
+                if not agent_result.get("failed")
+                and isinstance(agent_result.get("isles_reply_plan"), list)
+                else None
+            )
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
@@ -13537,7 +13543,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.source.platform == Platform.WEBHOOK
                 and self.is_isles_story_source(event.source)
             )
-            if _isles and response and not _already_sent:
+            if _isles and _isles_reply_plan and not response:
+                response = next(
+                    (
+                        str(action.get("content") or action.get("fallback_text") or "").strip()
+                        for action in _isles_reply_plan
+                        if str(action.get("content") or action.get("fallback_text") or "").strip()
+                    ),
+                    "我在呢。",
+                )
+            if _isles and (response or _isles_reply_plan) and not _already_sent:
                 _context_window = build_context_window(
                     agent_result.get("last_prompt_tokens", 0),
                     agent_result.get("context_length", 0),
@@ -13548,7 +13563,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 webhook = self.adapters.get(event.source.platform)
                 if webhook and hasattr(webhook, "mark_pending_reply_turn"):
-                    webhook.mark_pending_reply_turn(event.message_id, _context_window)
+                    webhook.mark_pending_reply_turn(
+                        event.message_id,
+                        _context_window,
+                        reply_plan=_isles_reply_plan,
+                    )
 
             # ── v4.2.19-phase2b: voice intent boundary ──
             _has_existing_audio = "MEDIA:" in (response or "")
@@ -19288,6 +19307,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or getattr(source, "user_id", "") == "webhook:isles-story"
             )
         )
+        _isles_sticker_scope_kwargs = None
+        if _is_isles_story_webhook and event_message_id and _status_adapter is not None:
+            try:
+                _sticker_delivery = (
+                    getattr(_status_adapter, "_delivery_info", {}).get(source.chat_id)
+                    or _status_adapter._static_isles_delivery()
+                )
+                _sticker_extra = _sticker_delivery.get("deliver_extra", {})
+                _sticker_callback_url = str(_sticker_extra.get("url") or "")
+                _sticker_token = str(_sticker_extra.get("token") or "")
+                if "/api/chat/callback" in _sticker_callback_url and _sticker_token:
+                    _isles_sticker_scope_kwargs = {
+                        "turn_id": str(event_message_id),
+                        "candidates_url": _sticker_callback_url.rsplit(
+                            "/api/chat/callback", 1
+                        )[0] + "/api/chat/stickers/candidates",
+                        "token": _sticker_token,
+                    }
+            except Exception:
+                logger.debug("Could not bind Isles sticker tool scope", exc_info=True)
         tool_progress_enabled = (
             progress_mode not in {"off", "log"}
             and (source.platform != Platform.WEBHOOK or _is_isles_story_webhook)
@@ -21179,7 +21218,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                if _isles_sticker_scope_kwargs:
+                    from tools.isles_sticker_tool import (
+                        get_isles_reply_plan,
+                        isles_sticker_turn_scope,
+                    )
+                    with isles_sticker_turn_scope(**_isles_sticker_scope_kwargs) as _sticker_state:
+                        result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                        _reply_plan = get_isles_reply_plan(_sticker_state)
+                    if _reply_plan:
+                        result["isles_reply_plan"] = _reply_plan
+                else:
+                    result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

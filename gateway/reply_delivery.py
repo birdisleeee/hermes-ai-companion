@@ -75,6 +75,9 @@ class ReplyUnit:
 
     content: str
     meta: Mapping[str, Any]
+    type: str = "text"
+    sticker: Mapping[str, Any] | None = None
+    fallback_text: str = ""
 
 
 def segment_reply(
@@ -187,6 +190,77 @@ def build_reply_units(
     return units
 
 
+def build_structured_reply_units(
+    plan: Sequence[Mapping[str, Any]],
+    *,
+    turn_id: str,
+    context_window: Mapping[str, Any] | None = None,
+) -> list[ReplyUnit]:
+    """Build ordered typed units from the turn-scoped Isles reply tool.
+
+    Invalid actions fail closed to an empty list. Sticker verification still
+    happens independently in the Worker callback, so this helper never turns
+    a model supplied path or URL into media.
+    """
+    normalized_turn_id = _valid_turn_id(turn_id)
+    if not isinstance(plan, Sequence) or isinstance(plan, (str, bytes)):
+        return []
+    if not 1 <= len(plan) <= 6:
+        return []
+    normalized: list[dict[str, Any]] = []
+    sticker_count = 0
+    for raw in plan:
+        if not isinstance(raw, Mapping):
+            return []
+        action_type = str(raw.get("type") or "")
+        if action_type == "text":
+            content = str(raw.get("content") or "").strip()
+            if not content:
+                return []
+            normalized.append({"type": "text", "content": content})
+            continue
+        if action_type == "sticker":
+            sticker_count += 1
+            if sticker_count > 1:
+                return []
+            sticker_id = str(raw.get("sticker_id") or "").strip()
+            candidate_token = str(raw.get("candidate_token") or "").strip()
+            catalog_version = str(raw.get("catalog_version") or "").strip()
+            fallback_text = str(raw.get("fallback_text") or "").strip()
+            if not (
+                re.fullmatch(r"[a-z][a-z0-9_]{2,63}", sticker_id)
+                and re.fullmatch(r"[a-f0-9]{32}", candidate_token)
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", catalog_version)
+                and fallback_text
+            ):
+                return []
+            normalized.append({
+                "type": "sticker",
+                "sticker": {
+                    "sticker_id": sticker_id,
+                    "candidate_token": candidate_token,
+                    "catalog_version": catalog_version,
+                },
+                "fallback_text": fallback_text,
+            })
+            continue
+        return []
+    count = len(normalized)
+    result: list[ReplyUnit] = []
+    for index, action in enumerate(normalized):
+        meta: dict[str, Any] = {"reply_group": build_reply_group(normalized_turn_id, index, count)}
+        if index == count - 1 and context_window:
+            meta["context_window"] = dict(context_window)
+        result.append(ReplyUnit(
+            content=str(action.get("content") or ""),
+            meta=meta,
+            type=str(action["type"]),
+            sticker=action.get("sticker"),
+            fallback_text=str(action.get("fallback_text") or ""),
+        ))
+    return result
+
+
 def build_fallback_reply_unit(
     units: Sequence[ReplyUnit],
     *,
@@ -203,7 +277,13 @@ def build_fallback_reply_unit(
         or failed_index >= len(units)
     ):
         raise ValueError("failed_index must reference an existing reply unit")
-    content = "\n\n".join(unit.content for unit in units[failed_index:] if unit.content)
+    content = "\n\n".join(
+        unit.content or unit.fallback_text
+        for unit in units[failed_index:]
+        if unit.content or unit.fallback_text
+    )
+    if not content:
+        content = "我在呢。"
     final_meta = dict(units[-1].meta)
     final_meta["reply_group"] = {
         "origin": "user_turn",

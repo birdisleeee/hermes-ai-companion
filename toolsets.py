@@ -576,9 +576,15 @@ TOOLSETS = {
         "includes": []
     },
 
+    "isles_stickers": {
+        "description": "Trusted Flying Bird Islands sticker intent search and one-sticker reply planning",
+        "tools": ["search_isles_stickers", "compose_isles_reply"],
+        "includes": []
+    },
+
     "hermes-isles-story": {
         "description": "Flying Bird Islands trusted private chat toolset - full personal agent access",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["search_isles_stickers", "compose_isles_reply"],
         "includes": []
     },
 

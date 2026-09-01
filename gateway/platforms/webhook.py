@@ -75,6 +75,7 @@ from gateway.reply_delivery import (
     build_context_window,
     build_fallback_reply_unit,
     build_reply_units,
+    build_structured_reply_units,
     reply_delay_seconds,
 )
 
@@ -315,12 +316,14 @@ class WebhookAdapter(BasePlatformAdapter):
         self,
         turn_id: str,
         context_window: Optional[dict],
+        reply_plan: Optional[List[dict]] = None,
     ) -> None:
         """Mark one completed Isles user turn as eligible for final delivery."""
         if not isinstance(turn_id, str) or not turn_id or any(ch.isspace() for ch in turn_id):
             return
         self._pending_reply_turns[turn_id] = {
             "context_window": dict(context_window) if context_window else None,
+            "reply_plan": [dict(item) for item in reply_plan] if reply_plan else None,
             "completed_at": time.time(),
         }
         while len(self._pending_reply_turns) > 200:
@@ -463,7 +466,13 @@ class WebhookAdapter(BasePlatformAdapter):
         turn_id = str(record.get("turn_id") or "")
         route_name = str(record.get("route") or "isles-story")
         units = [
-            ReplyUnit(content=str(item.get("content") or ""), meta=dict(item.get("meta") or {}))
+            ReplyUnit(
+                content=str(item.get("content") or ""),
+                meta=dict(item.get("meta") or {}),
+                type=str(item.get("type") or "text"),
+                sticker=dict(item.get("sticker") or {}) or None,
+                fallback_text=str(item.get("fallback_text") or ""),
+            )
             for item in record.get("outbox", [])
             if isinstance(item, dict) and item.get("content") is not None
         ]
@@ -480,13 +489,15 @@ class WebhookAdapter(BasePlatformAdapter):
             process_token=self._process_token,
         )
         await self._emit_isles_turn_status(turn_id, "delivering", route_name=route_name)
-        if len(units) > 1:
+        if len(units) > 1 or any(unit.type == "sticker" for unit in units):
             result = await self._deliver_grouped_http_callbacks(units, delivery, turn_id, config)
         else:
             result = await self._deliver_http_callback(
                 units[0].content,
                 delivery,
                 meta=dict(units[0].meta),
+                reply_type=units[0].type,
+                sticker=dict(units[0].sticker or {}),
             )
         if not result.success:
             self._isles_turn_store.transition(
@@ -522,6 +533,8 @@ class WebhookAdapter(BasePlatformAdapter):
                     unit.content,
                     delivery,
                     meta=dict(unit.meta),
+                    reply_type=unit.type,
+                    sticker=dict(unit.sticker or {}),
                 )
                 if last_result.success:
                     break
@@ -555,7 +568,13 @@ class WebhookAdapter(BasePlatformAdapter):
         return last_result
 
     async def _deliver_http_callback(
-        self, content: str, delivery: dict, meta: Optional[dict] = None
+        self,
+        content: str,
+        delivery: dict,
+        meta: Optional[dict] = None,
+        *,
+        reply_type: str = "text",
+        sticker: Optional[dict] = None,
     ) -> "SendResult":
         """POST agent response to a callback URL."""
         import aiohttp
@@ -569,6 +588,14 @@ class WebhookAdapter(BasePlatformAdapter):
         # Build payload (frontend contract: msg.meta.visible_reasoning)
         if delivery.get("deliver_extra", {}).get("forward_raw_body"):
             payload = delivery.get("payload", {"content": content, "author": "bird"})
+        elif reply_type == "sticker" and isinstance(sticker, dict):
+            payload = {
+                "protocol": "isles-reply-action-v1",
+                "content": "",
+                "author": "bird",
+                "type": "sticker",
+                "sticker": sticker,
+            }
         elif meta and isinstance(meta, dict) and 'voice' in meta:
             payload = {
                 "content": "",
@@ -921,19 +948,27 @@ class WebhookAdapter(BasePlatformAdapter):
                 _reply_config = delivery.get("reply_delivery")
                 if not isinstance(_reply_config, ReplyDeliveryConfig):
                     _reply_config = ReplyDeliveryConfig()
-                _can_segment = (
-                    _reply_config.segmented
-                    and _voice_meta is None
-                    and "MEDIA:" not in content
-                )
-                _units = build_reply_units(
-                    content,
-                    turn_id=reply_to,
-                    config=_reply_config if _can_segment else ReplyDeliveryConfig(),
-                    origin="user_turn",
-                    context_window=_turn_marker.get("context_window"),
-                    final_meta=_combined_meta,
-                )
+                _reply_plan = _turn_marker.get("reply_plan")
+                if _reply_plan and _voice_meta is None:
+                    _units = build_structured_reply_units(
+                        _reply_plan,
+                        turn_id=reply_to,
+                        context_window=_turn_marker.get("context_window"),
+                    )
+                else:
+                    _can_segment = (
+                        _reply_config.segmented
+                        and _voice_meta is None
+                        and "MEDIA:" not in content
+                    )
+                    _units = build_reply_units(
+                        content,
+                        turn_id=reply_to,
+                        config=_reply_config if _can_segment else ReplyDeliveryConfig(),
+                        origin="user_turn",
+                        context_window=_turn_marker.get("context_window"),
+                        final_meta=_combined_meta,
+                    )
                 if not _units:
                     _units = [ReplyUnit(content=content, meta=_combined_meta)]
                 if len(_units) == 1 and "reply_group" not in _units[0].meta:
@@ -949,10 +984,16 @@ class WebhookAdapter(BasePlatformAdapter):
                     "delivering",
                     retryable=True,
                     process_token=self._process_token,
-                    outbox=[{"content": unit.content, "meta": dict(unit.meta)} for unit in _units],
+                    outbox=[{
+                        "content": unit.content,
+                        "meta": dict(unit.meta),
+                        "type": unit.type,
+                        "sticker": dict(unit.sticker or {}),
+                        "fallback_text": unit.fallback_text,
+                    } for unit in _units],
                 )
                 await self._emit_isles_turn_status(reply_to, "delivering")
-                if len(_units) > 1:
+                if len(_units) > 1 or any(unit.type == "sticker" for unit in _units):
                     _result = await self._deliver_grouped_http_callbacks(
                         _units, delivery, reply_to, _reply_config
                     )
@@ -961,6 +1002,8 @@ class WebhookAdapter(BasePlatformAdapter):
                         _units[0].content,
                         delivery,
                         meta=dict(_units[0].meta) if _units[0].meta else None,
+                        reply_type=_units[0].type,
+                        sticker=dict(_units[0].sticker or {}),
                     )
                 if _result.success:
                     self._pending_reply_turns.pop(reply_to, None)

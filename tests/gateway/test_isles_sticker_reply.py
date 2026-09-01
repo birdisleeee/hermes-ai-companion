@@ -1,0 +1,237 @@
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult
+from gateway.platforms.webhook import WebhookAdapter
+from gateway.reply_delivery import (
+    ReplyDeliveryConfig,
+    build_fallback_reply_unit,
+    build_structured_reply_units,
+)
+from tools.isles_sticker_tool import (
+    compose_isles_reply,
+    get_isles_reply_plan,
+    isles_sticker_turn_scope,
+    search_isles_stickers,
+)
+
+
+TURN_ID = "msg_sticker_turn_001"
+TOKEN = "callback-token"
+CATALOG = "test-2026-08-31.1"
+CANDIDATE_TOKEN = "ab" * 16
+
+
+class _FakeHTTPResponse:
+    def __init__(self, value: dict):
+        self.value = value
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps(self.value, ensure_ascii=False).encode()
+
+
+def _candidate_response() -> dict:
+    return {
+        "ok": True,
+        "candidate_token": CANDIDATE_TOKEN,
+        "catalog_version": CATALOG,
+        "candidates": [
+            {
+                "sticker_id": "giz_comfort_wipe_tears_01",
+                "label": "安慰宝宝",
+                "meaning": "温柔安慰难过的对方",
+                "emotions": ["心疼", "关心"],
+                "tones": ["温柔", "陪伴"],
+                "scenarios": ["安慰对方"],
+                "intensity": 2,
+                "fallback_text": "抱抱你，我在呢。",
+            },
+            {
+                "sticker_id": "giz_comfort_headpat_01",
+                "label": "摸摸宝宝头",
+                "meaning": "摸摸头安抚",
+                "emotions": ["心疼"],
+                "tones": ["轻柔"],
+                "scenarios": ["安抚对方"],
+                "intensity": 2,
+                "fallback_text": "摸摸你。",
+            },
+        ],
+    }
+
+
+def test_tool_search_then_compose_ordered_text_and_one_sticker() -> None:
+    with isles_sticker_turn_scope(
+        turn_id=TURN_ID,
+        candidates_url="https://isles.example/api/chat/stickers/candidates",
+        token=TOKEN,
+    ) as state, patch(
+        "tools.isles_sticker_tool.urlopen",
+        return_value=_FakeHTTPResponse(_candidate_response()),
+    ):
+        search = json.loads(search_isles_stickers({
+            "intent": "对方难过，我想陪着他",
+            "emotion": "心疼",
+            "tone": "轻柔",
+            "contexts": ["安慰对方"],
+            "intensity": 2,
+        }))
+        assert [item["sticker_id"] for item in search["candidates"]] == [
+            "giz_comfort_wipe_tears_01", "giz_comfort_headpat_01"
+        ]
+        composed = json.loads(compose_isles_reply({"actions": [
+            {"type": "text", "content": "来，靠过来一点。"},
+            {"type": "sticker", "sticker_id": "giz_comfort_wipe_tears_01"},
+        ]}))
+        assert composed["ok"] is True
+        plan = get_isles_reply_plan(state)
+
+    assert [action["type"] for action in plan] == ["text", "sticker"]
+    assert plan[1]["candidate_token"] == CANDIDATE_TOKEN
+    assert plan[1]["catalog_version"] == CATALOG
+    assert "url" not in plan[1] and "path" not in plan[1]
+
+
+def test_tool_rejects_sticker_not_returned_for_this_turn() -> None:
+    with isles_sticker_turn_scope(
+        turn_id=TURN_ID,
+        candidates_url="https://isles.example/api/chat/stickers/candidates",
+        token=TOKEN,
+    ), patch(
+        "tools.isles_sticker_tool.urlopen",
+        return_value=_FakeHTTPResponse(_candidate_response()),
+    ):
+        search_isles_stickers({"intent": "安慰", "emotion": "心疼", "tone": "温柔"})
+        result = compose_isles_reply({"actions": [
+            {"type": "sticker", "sticker_id": "giz_laugh_tears_01"},
+        ]})
+    assert "可信候选" in result
+
+
+def test_tool_rejects_two_stickers_in_one_reply() -> None:
+    with isles_sticker_turn_scope(
+        turn_id=TURN_ID,
+        candidates_url="https://isles.example/api/chat/stickers/candidates",
+        token=TOKEN,
+    ), patch(
+        "tools.isles_sticker_tool.urlopen",
+        return_value=_FakeHTTPResponse(_candidate_response()),
+    ):
+        search_isles_stickers({"intent": "安慰", "emotion": "心疼", "tone": "温柔"})
+        result = compose_isles_reply({"actions": [
+            {"type": "sticker", "sticker_id": "giz_comfort_wipe_tears_01"},
+            {"type": "sticker", "sticker_id": "giz_comfort_headpat_01"},
+        ]})
+    assert "最多只能发送一张" in result
+
+
+def test_structured_units_keep_order_keys_and_final_context() -> None:
+    plan = [
+        {"type": "text", "content": "先说一句"},
+        {
+            "type": "sticker",
+            "sticker_id": "giz_comfort_wipe_tears_01",
+            "candidate_token": CANDIDATE_TOKEN,
+            "catalog_version": CATALOG,
+            "fallback_text": "抱抱你。",
+        },
+    ]
+    units = build_structured_reply_units(
+        plan, turn_id=TURN_ID, context_window={"used_tokens": 10}
+    )
+    assert [unit.type for unit in units] == ["text", "sticker"]
+    assert units[0].meta["reply_group"]["segment_key"] == f"{TURN_ID}:0"
+    assert units[1].meta["reply_group"]["segment_key"] == f"{TURN_ID}:1"
+    assert units[1].meta["reply_group"]["is_final"] is True
+    assert units[1].meta["context_window"] == {"used_tokens": 10}
+    fallback = build_fallback_reply_unit(units, turn_id=TURN_ID, failed_index=1)
+    assert fallback.type == "text"
+    assert fallback.content == "抱抱你。"
+    assert fallback.meta["reply_group"]["segment_key"] == f"{TURN_ID}:fallback:1"
+
+
+def _adapter() -> WebhookAdapter:
+    return WebhookAdapter(PlatformConfig(enabled=True, extra={
+        "host": "127.0.0.1",
+        "port": 0,
+        "routes": {
+            "isles-story": {
+                "secret": "test-secret-that-is-long-enough",
+                "deliver": "http_callback",
+                "deliver_extra": {
+                    "url": "https://isles.example/api/chat/callback",
+                    "token": TOKEN,
+                },
+                "reply_delivery": {"segmented": True, "min_delay_ms": 0, "max_delay_ms": 0},
+            },
+        },
+    }))
+
+
+@pytest.mark.asyncio
+async def test_webhook_send_uses_structured_units_instead_of_final_text() -> None:
+    adapter = _adapter()
+    adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+    adapter._deliver_grouped_http_callbacks = AsyncMock(return_value=SendResult(success=True))
+    adapter.mark_pending_reply_turn(
+        TURN_ID,
+        {"used_tokens": 1},
+        reply_plan=[
+            {"type": "text", "content": "文字"},
+            {
+                "type": "sticker",
+                "sticker_id": "giz_comfort_wipe_tears_01",
+                "candidate_token": CANDIDATE_TOKEN,
+                "catalog_version": CATALOG,
+                "fallback_text": "抱抱你。",
+            },
+        ],
+    )
+    result = await adapter.send(
+        "webhook:isles-story:main",
+        "模型结束语不会被解析成动作",
+        reply_to=TURN_ID,
+    )
+    assert result.success is True
+    units = adapter._deliver_grouped_http_callbacks.await_args.args[0]
+    assert [unit.type for unit in units] == ["text", "sticker"]
+    assert units[0].content == "文字"
+    assert units[1].sticker["sticker_id"] == "giz_comfort_wipe_tears_01"
+
+
+@pytest.mark.asyncio
+async def test_single_sticker_failure_degrades_to_text_terminal_unit() -> None:
+    adapter = _adapter()
+    unit = build_structured_reply_units([{
+        "type": "sticker",
+        "sticker_id": "giz_comfort_wipe_tears_01",
+        "candidate_token": CANDIDATE_TOKEN,
+        "catalog_version": CATALOG,
+        "fallback_text": "抱抱你，我在呢。",
+    }], turn_id=TURN_ID)[0]
+    adapter._deliver_http_callback = AsyncMock(side_effect=[
+        SendResult(success=False),
+        SendResult(success=False),
+        SendResult(success=False),
+        SendResult(success=True),
+    ])
+    with patch("gateway.platforms.webhook.asyncio.sleep", new=AsyncMock()):
+        result = await adapter._deliver_grouped_http_callbacks(
+            [unit], adapter._static_isles_delivery(), TURN_ID, ReplyDeliveryConfig()
+        )
+    assert result.success is True
+    assert adapter._deliver_http_callback.await_count == 4
+    fallback_call = adapter._deliver_http_callback.await_args_list[-1]
+    assert fallback_call.args[0] == "抱抱你，我在呢。"
+    assert fallback_call.kwargs.get("reply_type", "text") == "text"
