@@ -19307,6 +19307,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or getattr(source, "user_id", "") == "webhook:isles-story"
             )
         )
+        _status_adapter = self._adapter_for_source(source)
         _isles_sticker_scope_kwargs = None
         if _is_isles_story_webhook and event_message_id and _status_adapter is not None:
             try:
@@ -20147,7 +20148,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("event_callback hook error: %s", _e)
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self._adapter_for_source(source)
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are

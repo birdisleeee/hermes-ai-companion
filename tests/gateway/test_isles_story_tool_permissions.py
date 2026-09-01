@@ -140,6 +140,14 @@ async def test_isles_story_complete_agent_path_keeps_transport_platform_key(
             super().__init__(**kwargs)
 
     adapter = CleanupCaptureAdapter(platform=Platform.WEBHOOK)
+    adapter._delivery_info = {
+        "webhook:isles-story:main": {
+            "deliver_extra": {
+                "url": "https://isles.example/api/chat/callback",
+                "token": "test-callback-token",
+            }
+        }
+    }
     runner = _make_runner(adapter)
     gateway_run = _install_fakes(monkeypatch, IslesAgent, cleanup_on=False)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -160,6 +168,7 @@ async def test_isles_story_complete_agent_path_keeps_transport_platform_key(
         source=source,
         session_id="sess-isles",
         session_key="agent:main:webhook:webhook:isles-story:main",
+        event_message_id="turn-isles-001",
     )
 
     assert result["final_response"] == "done"
