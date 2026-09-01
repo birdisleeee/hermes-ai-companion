@@ -161,6 +161,85 @@ def test_structured_units_keep_order_keys_and_final_context() -> None:
     assert fallback.meta["reply_group"]["segment_key"] == f"{TURN_ID}:fallback:1"
 
 
+def test_structured_text_reuses_gateway_segmentation_around_sticker() -> None:
+    plan = [
+        {
+            "type": "text",
+            "content": "先说第一段。[[SPLIT]]再说第二段。",
+        },
+        {
+            "type": "sticker",
+            "sticker_id": "giz_comfort_wipe_tears_01",
+            "candidate_token": CANDIDATE_TOKEN,
+            "catalog_version": CATALOG,
+            "fallback_text": "抱抱你。",
+        },
+        {
+            "type": "text",
+            "content": "图片之后也能继续说。[[SPLIT]]最后再单独说一句。",
+        },
+    ]
+    units = build_structured_reply_units(
+        plan,
+        turn_id=TURN_ID,
+        context_window={"used_tokens": 12},
+        config=ReplyDeliveryConfig(
+            segmented=True,
+            hard_split_marker="[[SPLIT]]",
+        ),
+    )
+
+    assert [unit.type for unit in units] == [
+        "text",
+        "text",
+        "sticker",
+        "text",
+        "text",
+    ]
+    assert [unit.content for unit in units] == [
+        "先说第一段。",
+        "再说第二段。",
+        "",
+        "图片之后也能继续说。",
+        "最后再单独说一句。",
+    ]
+    assert [unit.meta["reply_group"]["index"] for unit in units] == list(range(5))
+    assert all(unit.meta["reply_group"]["count"] == 5 for unit in units)
+    assert units[-1].meta["context_window"] == {"used_tokens": 12}
+
+
+def test_structured_long_text_keeps_automatic_semantic_segmentation() -> None:
+    long_text = (
+        "今天发生了很多事情，我想慢慢讲给你听。"
+        "先把第一件事说完，再说第二件。"
+        "然后我们歇一会儿，不用着急。"
+        "最后我再抱抱你，陪你把今天收好。"
+    )
+    units = build_structured_reply_units(
+        [
+            {"type": "text", "content": long_text},
+            {
+                "type": "sticker",
+                "sticker_id": "giz_comfort_wipe_tears_01",
+                "candidate_token": CANDIDATE_TOKEN,
+                "catalog_version": CATALOG,
+                "fallback_text": "抱抱你。",
+            },
+        ],
+        turn_id=TURN_ID,
+        config=ReplyDeliveryConfig(
+            segmented=True,
+            short_reply_max=20,
+            target_segment=40,
+        ),
+    )
+
+    text_units = [unit for unit in units if unit.type == "text"]
+    assert len(text_units) >= 2
+    assert "".join(unit.content for unit in text_units) == long_text
+    assert units[-1].type == "sticker"
+
+
 def _adapter() -> WebhookAdapter:
     return WebhookAdapter(PlatformConfig(enabled=True, extra={
         "host": "127.0.0.1",

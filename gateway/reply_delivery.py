@@ -195,6 +195,7 @@ def build_structured_reply_units(
     *,
     turn_id: str,
     context_window: Mapping[str, Any] | None = None,
+    config: ReplyDeliveryConfig | None = None,
 ) -> list[ReplyUnit]:
     """Build ordered typed units from the turn-scoped Isles reply tool.
 
@@ -203,6 +204,7 @@ def build_structured_reply_units(
     a model supplied path or URL into media.
     """
     normalized_turn_id = _valid_turn_id(turn_id)
+    delivery_config = config or ReplyDeliveryConfig()
     if not isinstance(plan, Sequence) or isinstance(plan, (str, bytes)):
         return []
     if not 1 <= len(plan) <= 6:
@@ -217,7 +219,15 @@ def build_structured_reply_units(
             content = str(raw.get("content") or "").strip()
             if not content:
                 return []
-            normalized.append({"type": "text", "content": content})
+            segments = (
+                segment_reply(content, delivery_config)
+                if delivery_config.segmented
+                else [content]
+            )
+            normalized.extend(
+                {"type": "text", "content": segment}
+                for segment in segments
+            )
             continue
         if action_type == "sticker":
             sticker_count += 1

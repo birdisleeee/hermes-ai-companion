@@ -954,6 +954,7 @@ class WebhookAdapter(BasePlatformAdapter):
                         _reply_plan,
                         turn_id=reply_to,
                         context_window=_turn_marker.get("context_window"),
+                        config=_reply_config,
                     )
                 else:
                     _can_segment = (
