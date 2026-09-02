@@ -14,6 +14,7 @@ from gateway.reply_delivery import (
     build_structured_reply_units,
 )
 from tools.isles_sticker_tool import (
+    COMPOSE_ISLES_REPLY_SCHEMA,
     compose_isles_reply,
     get_isles_reply_plan,
     isles_sticker_turn_scope,
@@ -69,6 +70,25 @@ def _candidate_response() -> dict:
             },
         ],
     }
+
+
+def test_compose_schema_keeps_plain_replies_outside_sticker_tool() -> None:
+    description = COMPOSE_ISLES_REPLY_SCHEMA["description"]
+    assert "不使用表情包时不要调用，照常直接回复" in description
+    assert "把本轮要发送的全部文字和唯一一张表情包" in description
+    assert "表情包不影响本轮正常回复的内容和长度" in description
+
+
+def test_compose_rejects_plain_text_only_plan() -> None:
+    with isles_sticker_turn_scope(
+        turn_id=TURN_ID,
+        candidates_url="https://isles.example/api/chat/stickers/candidates",
+        token=TOKEN,
+    ):
+        result = compose_isles_reply({"actions": [
+            {"type": "text", "content": "这是一条普通文字回复。"},
+        ]})
+    assert "照常直接回复" in result
 
 
 def test_tool_search_then_compose_ordered_text_and_one_sticker() -> None:

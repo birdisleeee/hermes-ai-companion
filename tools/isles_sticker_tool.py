@@ -223,11 +223,13 @@ def compose_isles_reply(args: dict[str, Any], **_: Any) -> str:
             })
             continue
         return tool_error(f"第 {index + 1} 个动作 type 只能是 text 或 sticker")
+    if sticker_count != 1:
+        return tool_error("没有选择表情包时不要调用本工具；请照常直接回复")
     state["plan"] = plan
     return json.dumps({
         "ok": True,
         "accepted": len(plan),
-        "instruction": "回复计划已保存。不要再输出额外正文；结束当前回答即可",
+        "instruction": "本轮完整回复已接收，发送由系统接管；直接结束当前回答即可",
     }, ensure_ascii=False)
 
 
@@ -256,8 +258,11 @@ SEARCH_ISLES_STICKERS_SCHEMA = {
 COMPOSE_ISLES_REPLY_SCHEMA = {
     "name": "compose_isles_reply",
     "description": (
-        "把这一轮要发送给岛主的内容组成明确有序的动作。可发送纯文字、仅一张表情包，或文字加一张表情包；一轮最多一张图。"
-        "sticker_id 必须来自本轮 search_isles_stickers 的候选；系统会自己补齐验证凭据。调用成功后不要再输出额外正文。"
+        "仅当这一轮确定要使用表情包时调用；不使用表情包时不要调用，照常直接回复。"
+        "调用时，把本轮要发送的全部文字和唯一一张表情包按实际发送顺序放进 actions，发送随后由系统接管。"
+        "表情包不影响本轮正常回复的内容和长度；长文字会按原有规则自动分成多个文字气泡。"
+        "可仅发表情包，也可把表情包放在文字之前、中间或之后；同一轮最多一张图。"
+        "sticker_id 必须来自本轮 search_isles_stickers 的候选；系统会自己补齐验证凭据。"
     ),
     "parameters": {
         "type": "object",
@@ -270,7 +275,10 @@ COMPOSE_ISLES_REPLY_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "type": {"type": "string", "enum": ["text", "sticker"]},
-                        "content": {"type": "string", "description": "type=text 时填写"},
+                        "content": {
+                            "type": "string",
+                            "description": "type=text 时填写本轮要发送的文字；可写长文，系统会按需自动分段",
+                        },
                         "sticker_id": {"type": "string", "description": "type=sticker 时填写本轮候选 ID"},
                     },
                     "required": ["type"],

@@ -182,7 +182,7 @@ async def test_isles_story_complete_agent_path_keeps_transport_platform_key(
             assert composed == {
                 "ok": True,
                 "accepted": 2,
-                "instruction": "回复计划已保存。不要再输出额外正文；结束当前回答即可",
+                "instruction": "本轮完整回复已接收，发送由系统接管；直接结束当前回答即可",
             }
             return {"final_response": "宝宝", "messages": [], "api_calls": 2}
 
