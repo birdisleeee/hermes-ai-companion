@@ -55,6 +55,8 @@ def _candidate_response() -> dict:
                 "emotions": ["心疼", "关心"],
                 "tones": ["温柔", "陪伴"],
                 "scenarios": ["安慰对方"],
+                "keywords": ["抱抱", "陪伴"],
+                "avoid": ["正式通知", "严肃说明"],
                 "intensity": 2,
                 "fallback_text": "抱抱你，我在呢。",
             },
@@ -110,6 +112,8 @@ def test_tool_search_then_compose_ordered_text_and_one_sticker() -> None:
         assert [item["sticker_id"] for item in search["candidates"]] == [
             "giz_comfort_wipe_tears_01", "giz_comfort_headpat_01"
         ]
+        assert search["candidates"][0]["keywords"] == ["抱抱", "陪伴"]
+        assert search["candidates"][0]["avoid"] == ["正式通知", "严肃说明"]
         composed = json.loads(compose_isles_reply({"actions": [
             {"type": "text", "content": "来，靠过来一点。"},
             {"type": "sticker", "sticker_id": "giz_comfort_wipe_tears_01"},

@@ -158,6 +158,11 @@ def search_isles_stickers(args: dict[str, Any], **_: Any) -> str:
             "emotions": _clean_string_list(raw.get("emotions")),
             "tones": _clean_string_list(raw.get("tones")),
             "scenarios": _clean_string_list(raw.get("scenarios")),
+            # Keep the catalog's complete semantic envelope visible to the
+            # model. These fields are descriptive only; the Worker still
+            # re-validates the sticker_id and catalog version at delivery.
+            "keywords": _clean_string_list(raw.get("keywords")),
+            "avoid": _clean_string_list(raw.get("avoid")),
             "intensity": raw.get("intensity"),
             "fallback_text": _clean_text(raw.get("fallback_text"), 160),
         })
