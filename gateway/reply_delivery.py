@@ -77,8 +77,6 @@ class ReplyUnit:
     meta: Mapping[str, Any]
     type: str = "text"
     sticker: Mapping[str, Any] | None = None
-    # Read compatibility for older persisted outboxes. Sticker delivery never
-    # turns this value into a visible replacement message.
     fallback_text: str = ""
 
 
@@ -238,10 +236,12 @@ def build_structured_reply_units(
             sticker_id = str(raw.get("sticker_id") or "").strip()
             candidate_token = str(raw.get("candidate_token") or "").strip()
             catalog_version = str(raw.get("catalog_version") or "").strip()
+            fallback_text = str(raw.get("fallback_text") or "").strip()
             if not (
                 re.fullmatch(r"[a-z][a-z0-9_]{2,63}", sticker_id)
                 and re.fullmatch(r"[a-f0-9]{32}", candidate_token)
                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", catalog_version)
+                and fallback_text
             ):
                 return []
             normalized.append({
@@ -251,6 +251,7 @@ def build_structured_reply_units(
                     "candidate_token": candidate_token,
                     "catalog_version": catalog_version,
                 },
+                "fallback_text": fallback_text,
             })
             continue
         return []

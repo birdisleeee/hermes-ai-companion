@@ -112,7 +112,11 @@ def search_isles_stickers(args: dict[str, Any], **_: Any) -> str:
         "tone": _clean_text(args.get("tone"), 48),
         "contexts": _clean_string_list(args.get("contexts")),
         "keywords": _clean_string_list(args.get("keywords")),
+        "exclude": _clean_string_list(args.get("exclude")),
     }
+    intensity = args.get("intensity")
+    if isinstance(intensity, int) and not isinstance(intensity, bool) and 1 <= intensity <= 5:
+        query["intensity"] = intensity
     if not query["intent"] or not query["emotion"] or not query["tone"]:
         return tool_error("intent、emotion 和 tone 都必须填写；检索失败时直接正常文字回复，不要改用 emoji")
     payload = json.dumps(
@@ -154,7 +158,8 @@ def search_isles_stickers(args: dict[str, Any], **_: Any) -> str:
             "emotions": _clean_string_list(raw.get("emotions")),
             "tones": _clean_string_list(raw.get("tones")),
             "scenarios": _clean_string_list(raw.get("scenarios")),
-            "keywords": _clean_string_list(raw.get("keywords")),
+            "intensity": raw.get("intensity"),
+            "fallback_text": _clean_text(raw.get("fallback_text"), 160),
         })
     if not safe_candidates or not re.fullmatch(r"[a-f0-9]{32}", candidate_token):
         return tool_error("Worker 没有返回可验证候选。请正常文字回复，不要用 emoji 代替")
@@ -214,6 +219,7 @@ def compose_isles_reply(args: dict[str, Any], **_: Any) -> str:
                 "sticker_id": sticker_id,
                 "candidate_token": search["candidate_token"],
                 "catalog_version": search["catalog_version"],
+                "fallback_text": candidate.get("fallback_text") or "我在呢。",
             })
             continue
         return tool_error(f"第 {index + 1} 个动作 type 只能是 text 或 sticker")
@@ -241,6 +247,8 @@ SEARCH_ISLES_STICKERS_SCHEMA = {
             "tone": {"type": "string", "description": "表达语气，如轻柔、调皮、认真、夸张"},
             "contexts": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
             "keywords": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+            "exclude": {"type": "array", "items": {"type": "string"}, "maxItems": 8, "description": "明确不应出现的情绪或场景"},
+            "intensity": {"type": "integer", "minimum": 1, "maximum": 5},
         },
         "required": ["intent", "emotion", "tone"],
     },

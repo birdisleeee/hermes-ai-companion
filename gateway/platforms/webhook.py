@@ -441,30 +441,15 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return False
 
-    def _schedule_isles_outbox_retry(
-        self,
-        turn_id: str,
-        *,
-        repeat_background: bool = False,
-    ) -> None:
+    def _schedule_isles_outbox_retry(self, turn_id: str) -> None:
         existing = self._isles_retry_tasks.get(turn_id)
         if existing and not existing.done():
             return
-        task = asyncio.create_task(
-            self._retry_isles_outbox(
-                turn_id,
-                repeat_background=repeat_background,
-            )
-        )
+        task = asyncio.create_task(self._retry_isles_outbox(turn_id))
         self._isles_retry_tasks[turn_id] = task
         task.add_done_callback(lambda _: self._isles_retry_tasks.pop(turn_id, None))
 
-    async def _retry_isles_outbox(
-        self,
-        turn_id: str,
-        *,
-        repeat_background: bool = False,
-    ) -> None:
+    async def _retry_isles_outbox(self, turn_id: str) -> None:
         delay = 5.0
         while self.is_connected:
             record = self._isles_turn_store.get(turn_id)
@@ -473,15 +458,6 @@ class WebhookAdapter(BasePlatformAdapter):
             if record.get("state") not in {"delivery_failed", "delivering"}:
                 return
             if await self._resume_isles_outbox(record):
-                return
-            if not repeat_background:
-                await self._emit_isles_turn_status(
-                    turn_id,
-                    "failed",
-                    route_name=str(record.get("route") or "isles-story"),
-                    retryable=True,
-                    detail_code="callback_failed",
-                )
                 return
             await asyncio.sleep(delay)
             delay = min(60.0, delay * 2)
@@ -552,45 +528,19 @@ class WebhookAdapter(BasePlatformAdapter):
         """Deliver stable message units in order with bounded transport retries."""
         last_result = SendResult(success=False, error="No reply units")
         for index, unit in enumerate(units):
-            if unit.type == "sticker":
-                retry_deadline = time.monotonic() + 5.0
-                while True:
-                    last_result = await self._deliver_http_callback(
-                        unit.content,
-                        delivery,
-                        meta=dict(unit.meta),
-                        reply_type=unit.type,
-                        sticker=dict(unit.sticker or {}),
-                    )
-                    if last_result.success:
-                        break
-                    remaining = retry_deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    # Keep retrying throughout the five-second window without
-                    # turning a transient outage into a tight request loop.
-                    await asyncio.sleep(min(0.25, remaining))
-            else:
-                for attempt in range(3):
-                    last_result = await self._deliver_http_callback(
-                        unit.content,
-                        delivery,
-                        meta=dict(unit.meta),
-                        reply_type=unit.type,
-                        sticker=dict(unit.sticker or {}),
-                    )
-                    if last_result.success:
-                        break
-                    if attempt < 2:
-                        await asyncio.sleep(0.5 * (2 ** attempt))
+            for attempt in range(3):
+                last_result = await self._deliver_http_callback(
+                    unit.content,
+                    delivery,
+                    meta=dict(unit.meta),
+                    reply_type=unit.type,
+                    sticker=dict(unit.sticker or {}),
+                )
+                if last_result.success:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
             if not last_result.success:
-                if unit.type == "sticker":
-                    logger.warning(
-                        "[webhook] grouped sticker callback %d/%d failed; no text substitution",
-                        index + 1,
-                        len(units),
-                    )
-                    return last_result
                 fallback = build_fallback_reply_unit(
                     units,
                     turn_id=turn_id,
@@ -1079,11 +1029,7 @@ class WebhookAdapter(BasePlatformAdapter):
                         retryable=True,
                         detail_code="callback_failed",
                     )
-                    if not any(unit.type == "sticker" for unit in _units):
-                        self._schedule_isles_outbox_retry(
-                            reply_to,
-                            repeat_background=True,
-                        )
+                    self._schedule_isles_outbox_retry(reply_to)
                 return _result
 
             return await self._deliver_http_callback(

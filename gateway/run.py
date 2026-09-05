@@ -13543,6 +13543,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.source.platform == Platform.WEBHOOK
                 and self.is_isles_story_source(event.source)
             )
+            if _isles and _isles_reply_plan and not response:
+                response = next(
+                    (
+                        str(action.get("content") or action.get("fallback_text") or "").strip()
+                        for action in _isles_reply_plan
+                        if str(action.get("content") or action.get("fallback_text") or "").strip()
+                    ),
+                    "我在呢。",
+                )
             if _isles and (response or _isles_reply_plan) and not _already_sent:
                 _context_window = build_context_window(
                     agent_result.get("last_prompt_tokens", 0),
