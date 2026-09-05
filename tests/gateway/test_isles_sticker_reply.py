@@ -10,7 +10,6 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import WebhookAdapter
 from gateway.reply_delivery import (
     ReplyDeliveryConfig,
-    build_fallback_reply_unit,
     build_structured_reply_units,
 )
 from tools.isles_sticker_tool import (
@@ -107,13 +106,14 @@ def test_tool_search_then_compose_ordered_text_and_one_sticker() -> None:
             "emotion": "心疼",
             "tone": "轻柔",
             "contexts": ["安慰对方"],
-            "intensity": 2,
         }))
         assert [item["sticker_id"] for item in search["candidates"]] == [
             "giz_comfort_wipe_tears_01", "giz_comfort_headpat_01"
         ]
         assert search["candidates"][0]["keywords"] == ["抱抱", "陪伴"]
-        assert search["candidates"][0]["avoid"] == ["正式通知", "严肃说明"]
+        assert set(search["candidates"][0]) == {
+            "sticker_id", "label", "meaning", "emotions", "tones", "scenarios", "keywords"
+        }
         composed = json.loads(compose_isles_reply({"actions": [
             {"type": "text", "content": "来，靠过来一点。"},
             {"type": "sticker", "sticker_id": "giz_comfort_wipe_tears_01"},
@@ -124,6 +124,7 @@ def test_tool_search_then_compose_ordered_text_and_one_sticker() -> None:
     assert [action["type"] for action in plan] == ["text", "sticker"]
     assert plan[1]["candidate_token"] == CANDIDATE_TOKEN
     assert plan[1]["catalog_version"] == CATALOG
+    assert "fallback_text" not in plan[1]
     assert "url" not in plan[1] and "path" not in plan[1]
 
 
@@ -179,10 +180,7 @@ def test_structured_units_keep_order_keys_and_final_context() -> None:
     assert units[1].meta["reply_group"]["segment_key"] == f"{TURN_ID}:1"
     assert units[1].meta["reply_group"]["is_final"] is True
     assert units[1].meta["context_window"] == {"used_tokens": 10}
-    fallback = build_fallback_reply_unit(units, turn_id=TURN_ID, failed_index=1)
-    assert fallback.type == "text"
-    assert fallback.content == "抱抱你。"
-    assert fallback.meta["reply_group"]["segment_key"] == f"{TURN_ID}:fallback:1"
+    assert units[1].fallback_text == ""
 
 
 def test_structured_text_reuses_gateway_segmentation_around_sticker() -> None:
@@ -314,7 +312,7 @@ async def test_webhook_send_uses_structured_units_instead_of_final_text() -> Non
 
 
 @pytest.mark.asyncio
-async def test_single_sticker_failure_degrades_to_text_terminal_unit() -> None:
+async def test_single_sticker_failure_is_not_replaced_with_text() -> None:
     adapter = _adapter()
     unit = build_structured_reply_units([{
         "type": "sticker",
@@ -327,14 +325,14 @@ async def test_single_sticker_failure_degrades_to_text_terminal_unit() -> None:
         SendResult(success=False),
         SendResult(success=False),
         SendResult(success=False),
-        SendResult(success=True),
     ])
     with patch("gateway.platforms.webhook.asyncio.sleep", new=AsyncMock()):
         result = await adapter._deliver_grouped_http_callbacks(
             [unit], adapter._static_isles_delivery(), TURN_ID, ReplyDeliveryConfig()
         )
-    assert result.success is True
-    assert adapter._deliver_http_callback.await_count == 4
-    fallback_call = adapter._deliver_http_callback.await_args_list[-1]
-    assert fallback_call.args[0] == "抱抱你，我在呢。"
-    assert fallback_call.kwargs.get("reply_type", "text") == "text"
+    assert result.success is False
+    assert adapter._deliver_http_callback.await_count == 3
+    assert all(
+        call.kwargs.get("reply_type") == "sticker"
+        for call in adapter._deliver_http_callback.await_args_list
+    )

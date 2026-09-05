@@ -541,6 +541,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 if attempt < 2:
                     await asyncio.sleep(0.5 * (2 ** attempt))
             if not last_result.success:
+                if unit.type == "sticker":
+                    logger.warning(
+                        "[webhook] grouped sticker callback %d/%d failed; no text substitution",
+                        index + 1,
+                        len(units),
+                    )
+                    return last_result
                 fallback = build_fallback_reply_unit(
                     units,
                     turn_id=turn_id,
