@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -326,7 +326,8 @@ async def test_single_sticker_failure_is_not_replaced_with_text() -> None:
         SendResult(success=False),
         SendResult(success=False),
     ])
-    with patch("gateway.platforms.webhook.asyncio.sleep", new=AsyncMock()):
+    sleep = AsyncMock()
+    with patch("gateway.platforms.webhook.asyncio.sleep", new=sleep):
         result = await adapter._deliver_grouped_http_callbacks(
             [unit], adapter._static_isles_delivery(), TURN_ID, ReplyDeliveryConfig()
         )
@@ -335,4 +336,68 @@ async def test_single_sticker_failure_is_not_replaced_with_text() -> None:
     assert all(
         call.kwargs.get("reply_type") == "sticker"
         for call in adapter._deliver_http_callback.await_args_list
+    )
+    assert sleep.await_args_list == [call(5.0), call(5.0)]
+
+
+@pytest.mark.asyncio
+async def test_failed_sticker_turn_waits_for_manual_pending_retry() -> None:
+    adapter = _adapter()
+    adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+    adapter._deliver_grouped_http_callbacks = AsyncMock(
+        return_value=SendResult(success=False, error="sticker callback failed")
+    )
+    adapter._schedule_isles_outbox_retry = MagicMock()
+    adapter.mark_pending_reply_turn(
+        TURN_ID,
+        {"used_tokens": 1},
+        reply_plan=[
+            {"type": "text", "content": "这一轮先说的话"},
+            {
+                "type": "sticker",
+                "sticker_id": "giz_comfort_wipe_tears_01",
+                "candidate_token": CANDIDATE_TOKEN,
+                "catalog_version": CATALOG,
+            },
+        ],
+    )
+
+    result = await adapter.send(
+        "webhook:isles-story:main",
+        "",
+        reply_to=TURN_ID,
+    )
+
+    assert result.success is False
+    adapter._schedule_isles_outbox_retry.assert_not_called()
+    assert call(
+        TURN_ID,
+        "failed",
+        retryable=True,
+        detail_code="callback_failed",
+    ) in adapter._emit_isles_turn_status.await_args_list
+
+
+@pytest.mark.asyncio
+async def test_one_manual_retry_runs_one_bounded_outbox_attempt() -> None:
+    adapter = _adapter()
+    adapter._mark_connected()
+    record = {
+        "state": "delivery_failed",
+        "route": "isles-story",
+        "outbox": [{"content": ""}],
+    }
+    adapter._isles_turn_store.get = MagicMock(return_value=record)
+    adapter._resume_isles_outbox = AsyncMock(return_value=False)
+    adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+
+    await adapter._retry_isles_outbox(TURN_ID)
+
+    adapter._resume_isles_outbox.assert_awaited_once_with(record)
+    adapter._emit_isles_turn_status.assert_awaited_once_with(
+        TURN_ID,
+        "failed",
+        route_name="isles-story",
+        retryable=True,
+        detail_code="callback_failed",
     )

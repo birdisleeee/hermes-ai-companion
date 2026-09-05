@@ -441,15 +441,30 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return False
 
-    def _schedule_isles_outbox_retry(self, turn_id: str) -> None:
+    def _schedule_isles_outbox_retry(
+        self,
+        turn_id: str,
+        *,
+        repeat_background: bool = False,
+    ) -> None:
         existing = self._isles_retry_tasks.get(turn_id)
         if existing and not existing.done():
             return
-        task = asyncio.create_task(self._retry_isles_outbox(turn_id))
+        task = asyncio.create_task(
+            self._retry_isles_outbox(
+                turn_id,
+                repeat_background=repeat_background,
+            )
+        )
         self._isles_retry_tasks[turn_id] = task
         task.add_done_callback(lambda _: self._isles_retry_tasks.pop(turn_id, None))
 
-    async def _retry_isles_outbox(self, turn_id: str) -> None:
+    async def _retry_isles_outbox(
+        self,
+        turn_id: str,
+        *,
+        repeat_background: bool = False,
+    ) -> None:
         delay = 5.0
         while self.is_connected:
             record = self._isles_turn_store.get(turn_id)
@@ -458,6 +473,15 @@ class WebhookAdapter(BasePlatformAdapter):
             if record.get("state") not in {"delivery_failed", "delivering"}:
                 return
             if await self._resume_isles_outbox(record):
+                return
+            if not repeat_background:
+                await self._emit_isles_turn_status(
+                    turn_id,
+                    "failed",
+                    route_name=str(record.get("route") or "isles-story"),
+                    retryable=True,
+                    detail_code="callback_failed",
+                )
                 return
             await asyncio.sleep(delay)
             delay = min(60.0, delay * 2)
@@ -539,7 +563,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 if last_result.success:
                     break
                 if attempt < 2:
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    await asyncio.sleep(5.0)
             if not last_result.success:
                 if unit.type == "sticker":
                     logger.warning(
@@ -1036,7 +1060,11 @@ class WebhookAdapter(BasePlatformAdapter):
                         retryable=True,
                         detail_code="callback_failed",
                     )
-                    self._schedule_isles_outbox_retry(reply_to)
+                    if not any(unit.type == "sticker" for unit in _units):
+                        self._schedule_isles_outbox_retry(
+                            reply_to,
+                            repeat_background=True,
+                        )
                 return _result
 
             return await self._deliver_http_callback(
