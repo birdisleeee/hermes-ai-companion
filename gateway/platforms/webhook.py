@@ -552,18 +552,37 @@ class WebhookAdapter(BasePlatformAdapter):
         """Deliver stable message units in order with bounded transport retries."""
         last_result = SendResult(success=False, error="No reply units")
         for index, unit in enumerate(units):
-            for attempt in range(3):
-                last_result = await self._deliver_http_callback(
-                    unit.content,
-                    delivery,
-                    meta=dict(unit.meta),
-                    reply_type=unit.type,
-                    sticker=dict(unit.sticker or {}),
-                )
-                if last_result.success:
-                    break
-                if attempt < 2:
-                    await asyncio.sleep(5.0)
+            if unit.type == "sticker":
+                retry_deadline = time.monotonic() + 5.0
+                while True:
+                    last_result = await self._deliver_http_callback(
+                        unit.content,
+                        delivery,
+                        meta=dict(unit.meta),
+                        reply_type=unit.type,
+                        sticker=dict(unit.sticker or {}),
+                    )
+                    if last_result.success:
+                        break
+                    remaining = retry_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    # Keep retrying throughout the five-second window without
+                    # turning a transient outage into a tight request loop.
+                    await asyncio.sleep(min(0.25, remaining))
+            else:
+                for attempt in range(3):
+                    last_result = await self._deliver_http_callback(
+                        unit.content,
+                        delivery,
+                        meta=dict(unit.meta),
+                        reply_type=unit.type,
+                        sticker=dict(unit.sticker or {}),
+                    )
+                    if last_result.success:
+                        break
+                    if attempt < 2:
+                        await asyncio.sleep(0.5 * (2 ** attempt))
             if not last_result.success:
                 if unit.type == "sticker":
                     logger.warning(

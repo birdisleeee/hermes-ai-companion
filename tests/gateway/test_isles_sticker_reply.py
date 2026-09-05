@@ -321,23 +321,28 @@ async def test_single_sticker_failure_is_not_replaced_with_text() -> None:
         "catalog_version": CATALOG,
         "fallback_text": "抱抱你，我在呢。",
     }], turn_id=TURN_ID)[0]
-    adapter._deliver_http_callback = AsyncMock(side_effect=[
-        SendResult(success=False),
-        SendResult(success=False),
-        SendResult(success=False),
-    ])
-    sleep = AsyncMock()
-    with patch("gateway.platforms.webhook.asyncio.sleep", new=sleep):
+    adapter._deliver_http_callback = AsyncMock(return_value=SendResult(success=False))
+    clock = [0.0]
+
+    async def advance_clock(seconds: float) -> None:
+        clock[0] += seconds
+
+    sleep = AsyncMock(side_effect=advance_clock)
+    with patch("gateway.platforms.webhook.asyncio.sleep", new=sleep), patch(
+        "gateway.platforms.webhook.time.monotonic",
+        side_effect=lambda: clock[0],
+    ):
         result = await adapter._deliver_grouped_http_callbacks(
             [unit], adapter._static_isles_delivery(), TURN_ID, ReplyDeliveryConfig()
         )
     assert result.success is False
-    assert adapter._deliver_http_callback.await_count == 3
+    assert adapter._deliver_http_callback.await_count == 21
     assert all(
         call.kwargs.get("reply_type") == "sticker"
         for call in adapter._deliver_http_callback.await_args_list
     )
-    assert sleep.await_args_list == [call(5.0), call(5.0)]
+    assert sum(item.args[0] for item in sleep.await_args_list) == 5.0
+    assert all(item.args[0] <= 0.25 for item in sleep.await_args_list)
 
 
 @pytest.mark.asyncio
