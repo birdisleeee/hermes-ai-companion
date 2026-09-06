@@ -75,7 +75,8 @@ def _candidate_response() -> dict:
 def test_compose_schema_keeps_plain_replies_outside_sticker_tool() -> None:
     description = COMPOSE_ISLES_REPLY_SCHEMA["description"]
     assert "不使用表情包时不要调用，照常直接回复" in description
-    assert "把本轮要发送的全部文字和唯一一张表情包" in description
+    assert "把本轮要发送的全部文字和一张或多张表情包" in description
+    assert COMPOSE_ISLES_REPLY_SCHEMA["parameters"]["properties"]["actions"]["maxItems"] == 12
     assert "表情包不影响本轮正常回复的内容和长度" in description
 
 
@@ -139,21 +140,27 @@ def test_tool_rejects_sticker_not_returned_for_this_turn() -> None:
     assert "可信候选" in result
 
 
-def test_tool_rejects_two_stickers_in_one_reply() -> None:
+def test_tool_accepts_multiple_stickers_in_exact_order() -> None:
     with isles_sticker_turn_scope(
         turn_id=TURN_ID,
         candidates_url="https://isles.example/api/chat/stickers/candidates",
         token=TOKEN,
-    ), patch(
+    ) as state, patch(
         "tools.isles_sticker_tool.urlopen",
         return_value=_FakeHTTPResponse(_candidate_response()),
     ):
         search_isles_stickers({"intent": "安慰", "emotion": "心疼", "tone": "温柔"})
-        result = compose_isles_reply({"actions": [
+        result = json.loads(compose_isles_reply({"actions": [
             {"type": "sticker", "sticker_id": "giz_comfort_wipe_tears_01"},
+            {"type": "text", "content": "再抱一下。"},
             {"type": "sticker", "sticker_id": "giz_comfort_headpat_01"},
-        ]})
-    assert "最多只能发送一张" in result
+        ]}))
+        plan = get_isles_reply_plan(state)
+    assert result["ok"] is True
+    assert [action["type"] for action in plan] == ["sticker", "text", "sticker"]
+    assert [action["sticker_id"] for action in plan if action["type"] == "sticker"] == [
+        "giz_comfort_wipe_tears_01", "giz_comfort_headpat_01"
+    ]
 
 
 def test_structured_units_keep_order_keys_and_final_context() -> None:
@@ -166,19 +173,28 @@ def test_structured_units_keep_order_keys_and_final_context() -> None:
             "catalog_version": CATALOG,
             "fallback_text": "抱抱你。",
         },
+        {"type": "text", "content": "再说一句"},
+        {
+            "type": "sticker",
+            "sticker_id": "giz_comfort_headpat_01",
+            "candidate_token": CANDIDATE_TOKEN,
+            "catalog_version": CATALOG,
+            "fallback_text": "摸摸你。",
+        },
     ]
     units = build_structured_reply_units(
         plan, turn_id=TURN_ID, context_window={"used_tokens": 10}
     )
-    assert [unit.type for unit in units] == ["text", "sticker"]
+    assert [unit.type for unit in units] == ["text", "sticker", "text", "sticker"]
     assert units[0].meta["reply_group"]["segment_key"] == f"{TURN_ID}:0"
     assert units[1].meta["reply_group"]["segment_key"] == f"{TURN_ID}:1"
-    assert units[1].meta["reply_group"]["is_final"] is True
-    assert units[1].meta["context_window"] == {"used_tokens": 10}
-    fallback = build_fallback_reply_unit(units, turn_id=TURN_ID, failed_index=1)
+    assert units[3].meta["reply_group"]["segment_key"] == f"{TURN_ID}:3"
+    assert units[3].meta["reply_group"]["is_final"] is True
+    assert units[3].meta["context_window"] == {"used_tokens": 10}
+    fallback = build_fallback_reply_unit(units, turn_id=TURN_ID, failed_index=3)
     assert fallback.type == "text"
-    assert fallback.content == "抱抱你。"
-    assert fallback.meta["reply_group"]["segment_key"] == f"{TURN_ID}:fallback:1"
+    assert fallback.content == "摸摸你。"
+    assert fallback.meta["reply_group"]["segment_key"] == f"{TURN_ID}:fallback:3"
 
 
 def test_structured_text_reuses_gateway_segmentation_around_sticker() -> None:
@@ -295,6 +311,14 @@ async def test_webhook_send_uses_structured_units_instead_of_final_text() -> Non
                 "catalog_version": CATALOG,
                 "fallback_text": "抱抱你。",
             },
+            {"type": "text", "content": "中间文字"},
+            {
+                "type": "sticker",
+                "sticker_id": "giz_comfort_headpat_01",
+                "candidate_token": CANDIDATE_TOKEN,
+                "catalog_version": CATALOG,
+                "fallback_text": "摸摸你。",
+            },
         ],
     )
     result = await adapter.send(
@@ -304,9 +328,11 @@ async def test_webhook_send_uses_structured_units_instead_of_final_text() -> Non
     )
     assert result.success is True
     units = adapter._deliver_grouped_http_callbacks.await_args.args[0]
-    assert [unit.type for unit in units] == ["text", "sticker"]
+    assert [unit.type for unit in units] == ["text", "sticker", "text", "sticker"]
     assert units[0].content == "文字"
     assert units[1].sticker["sticker_id"] == "giz_comfort_wipe_tears_01"
+    assert units[2].content == "中间文字"
+    assert units[3].sticker["sticker_id"] == "giz_comfort_headpat_01"
 
 
 @pytest.mark.asyncio

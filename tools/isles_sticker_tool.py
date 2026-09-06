@@ -191,8 +191,8 @@ def compose_isles_reply(args: dict[str, Any], **_: Any) -> str:
     except RuntimeError as error:
         return tool_error(str(error))
     raw_actions = args.get("actions")
-    if not isinstance(raw_actions, list) or not 1 <= len(raw_actions) <= 6:
-        return tool_error("actions 必须包含 1-6 个按发送顺序排列的动作")
+    if not isinstance(raw_actions, list) or not 1 <= len(raw_actions) <= 12:
+        return tool_error("actions 必须包含 1-12 个按发送顺序排列的动作")
     plan: list[dict[str, Any]] = []
     sticker_count = 0
     for index, raw in enumerate(raw_actions):
@@ -207,8 +207,6 @@ def compose_isles_reply(args: dict[str, Any], **_: Any) -> str:
             continue
         if action_type == "sticker":
             sticker_count += 1
-            if sticker_count > 1:
-                return tool_error("一轮回应最多只能发送一张表情包；请保留最贴合表达意图的那一张")
             sticker_id = str(raw.get("sticker_id") or "").strip()
             found = _find_candidate(state, sticker_id)
             if not _ID_RE.fullmatch(sticker_id) or found is None:
@@ -223,7 +221,7 @@ def compose_isles_reply(args: dict[str, Any], **_: Any) -> str:
             })
             continue
         return tool_error(f"第 {index + 1} 个动作 type 只能是 text 或 sticker")
-    if sticker_count != 1:
+    if sticker_count < 1:
         return tool_error("没有选择表情包时不要调用本工具；请照常直接回复")
     state["plan"] = plan
     return json.dumps({
@@ -259,9 +257,9 @@ COMPOSE_ISLES_REPLY_SCHEMA = {
     "name": "compose_isles_reply",
     "description": (
         "仅当这一轮确定要使用表情包时调用；不使用表情包时不要调用，照常直接回复。"
-        "调用时，把本轮要发送的全部文字和唯一一张表情包按实际发送顺序放进 actions，发送随后由系统接管。"
+        "调用时，把本轮要发送的全部文字和一张或多张表情包按实际发送顺序放进 actions，发送随后由系统接管。"
         "表情包不影响本轮正常回复的内容和长度；长文字会按原有规则自动分成多个文字气泡。"
-        "可仅发表情包，也可把表情包放在文字之前、中间或之后；同一轮最多一张图。"
+        "可仅发表情包，也可把多张表情包放在文字之前、中间或之后；actions 的先后顺序就是实际发送顺序。"
         "sticker_id 必须来自本轮 search_isles_stickers 的候选；系统会自己补齐验证凭据。"
     ),
     "parameters": {
@@ -270,7 +268,7 @@ COMPOSE_ISLES_REPLY_SCHEMA = {
             "actions": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 6,
+                "maxItems": 12,
                 "items": {
                     "type": "object",
                     "properties": {

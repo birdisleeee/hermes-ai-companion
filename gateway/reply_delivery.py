@@ -207,10 +207,9 @@ def build_structured_reply_units(
     delivery_config = config or ReplyDeliveryConfig()
     if not isinstance(plan, Sequence) or isinstance(plan, (str, bytes)):
         return []
-    if not 1 <= len(plan) <= 6:
+    if not 1 <= len(plan) <= 12:
         return []
     normalized: list[dict[str, Any]] = []
-    sticker_count = 0
     for raw in plan:
         if not isinstance(raw, Mapping):
             return []
@@ -230,9 +229,6 @@ def build_structured_reply_units(
             )
             continue
         if action_type == "sticker":
-            sticker_count += 1
-            if sticker_count > 1:
-                return []
             sticker_id = str(raw.get("sticker_id") or "").strip()
             candidate_token = str(raw.get("candidate_token") or "").strip()
             catalog_version = str(raw.get("catalog_version") or "").strip()
