@@ -74,22 +74,27 @@ def _candidate_response() -> dict:
 
 def test_compose_schema_keeps_plain_replies_outside_sticker_tool() -> None:
     description = COMPOSE_ISLES_REPLY_SCHEMA["description"]
-    assert "不使用表情包时不要调用，照常直接回复" in description
+    assert "不使用表情包时通常应照常直接回复" in description
+    assert "完整文字" in description
+    assert "只回复一个称呼" in description
     assert "把本轮要发送的全部文字和一张或多张表情包" in description
     assert COMPOSE_ISLES_REPLY_SCHEMA["parameters"]["properties"]["actions"]["maxItems"] == 12
     assert "表情包不影响本轮正常回复的内容和长度" in description
 
 
-def test_compose_rejects_plain_text_only_plan() -> None:
+def test_compose_plain_text_only_plan_degrades_without_loss() -> None:
     with isles_sticker_turn_scope(
         turn_id=TURN_ID,
         candidates_url="https://isles.example/api/chat/stickers/candidates",
         token=TOKEN,
-    ):
-        result = compose_isles_reply({"actions": [
+    ) as state:
+        result = json.loads(compose_isles_reply({"actions": [
             {"type": "text", "content": "这是一条普通文字回复。"},
-        ]})
-    assert "照常直接回复" in result
+        ]}))
+        plan = get_isles_reply_plan(state)
+    assert result["ok"] is True
+    assert "文字回复已接收" in result["instruction"]
+    assert plan == [{"type": "text", "content": "这是一条普通文字回复。"}]
 
 
 def test_tool_search_then_compose_ordered_text_and_one_sticker() -> None:
@@ -333,6 +338,37 @@ async def test_webhook_send_uses_structured_units_instead_of_final_text() -> Non
     assert units[1].sticker["sticker_id"] == "giz_comfort_wipe_tears_01"
     assert units[2].content == "中间文字"
     assert units[3].sticker["sticker_id"] == "giz_comfort_headpat_01"
+
+
+@pytest.mark.asyncio
+async def test_webhook_send_preserves_all_text_from_misused_sticker_tool() -> None:
+    adapter = _adapter()
+    adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+    adapter._deliver_grouped_http_callbacks = AsyncMock(return_value=SendResult(success=True))
+    adapter.mark_pending_reply_turn(
+        TURN_ID,
+        {"used_tokens": 1},
+        reply_plan=[
+            {"type": "text", "content": "第一段正文。"},
+            {"type": "text", "content": "第二段正文。"},
+            {"type": "text", "content": "第三段正文。"},
+        ],
+    )
+
+    result = await adapter.send(
+        "webhook:isles-story:main",
+        "宝宝",
+        reply_to=TURN_ID,
+    )
+
+    assert result.success is True
+    units = adapter._deliver_grouped_http_callbacks.await_args.args[0]
+    assert [unit.type for unit in units] == ["text", "text", "text"]
+    assert [unit.content for unit in units] == [
+        "第一段正文。",
+        "第二段正文。",
+        "第三段正文。",
+    ]
 
 
 @pytest.mark.asyncio

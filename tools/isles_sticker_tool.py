@@ -221,13 +221,15 @@ def compose_isles_reply(args: dict[str, Any], **_: Any) -> str:
             })
             continue
         return tool_error(f"第 {index + 1} 个动作 type 只能是 text 或 sticker")
-    if sticker_count < 1:
-        return tool_error("没有选择表情包时不要调用本工具；请照常直接回复")
     state["plan"] = plan
     return json.dumps({
         "ok": True,
         "accepted": len(plan),
-        "instruction": "本轮完整回复已接收，发送由系统接管；直接结束当前回答即可",
+        "instruction": (
+            "本轮完整回复已接收，发送由系统接管；直接结束当前回答即可"
+            if sticker_count
+            else "本轮未选择表情包，但文字回复已接收；发送由系统接管，直接结束当前回答即可"
+        ),
     }, ensure_ascii=False)
 
 
@@ -256,8 +258,9 @@ SEARCH_ISLES_STICKERS_SCHEMA = {
 COMPOSE_ISLES_REPLY_SCHEMA = {
     "name": "compose_isles_reply",
     "description": (
-        "仅当这一轮确定要使用表情包时调用；不使用表情包时不要调用，照常直接回复。"
+        "仅当这一轮确定要使用表情包时调用；不使用表情包时通常应照常直接回复。"
         "调用时，把本轮要发送的全部文字和一张或多张表情包按实际发送顺序放进 actions，发送随后由系统接管。"
+        "如果已经误把完整文字放进本工具但没有选择表情包，系统会保留并发送这些文字；绝不能删减、改成简短占位或只回复一个称呼。"
         "表情包不影响本轮正常回复的内容和长度；长文字会按原有规则自动分成多个文字气泡。"
         "可仅发表情包，也可把多张表情包放在文字之前、中间或之后；actions 的先后顺序就是实际发送顺序。"
         "sticker_id 必须来自本轮 search_isles_stickers 的候选；系统会自己补齐验证凭据。"
