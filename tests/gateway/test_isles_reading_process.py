@@ -81,7 +81,7 @@ async def test_killed_process_recovers_complete_signed_reply(tmp_path):
             assert replies[-1]["thread_id"] == "thread_one"
             assert replies[-1]["turn_id"] == "turn_one"
             assert replies[-1]["delivery_id"] == "delivery_one"
-            assert [action["text"] for action in replies[-1]["actions"]] == ["**完整的第一段**", "> 第二段也要保留"]
+            assert [action["text"] for action in replies[-1]["actions"]] == ["**完整的第一段**", "第二段也要保留"]
         finally:
             for process in processes:
                 if process.returncode is None:

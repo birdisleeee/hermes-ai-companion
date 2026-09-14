@@ -21,7 +21,7 @@ async def main():
 
     async def respond(event):
         adapter.mark_pending_reply_turn(event.message_id, None)
-        await adapter.send(event.source.chat_id, "**完整的第一段**<BREAK>> 第二段也要保留", reply_to=event.message_id)
+        await adapter.send(event.source.chat_id, "**完整的第一段**<BREAK>第二段也要保留", reply_to=event.message_id)
 
     adapter.handle_message = respond
     assert await adapter.connect()

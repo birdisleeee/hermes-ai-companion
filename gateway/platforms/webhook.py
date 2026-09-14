@@ -613,7 +613,7 @@ class WebhookAdapter(BasePlatformAdapter):
             "turn_id": turn_id,
             "delivery_id": delivery_id,
             "actions": [
-                {"kind": "text", "index": index, "count": len(units), "text": unit.content}
+                {"kind": "text", "index": index, "count": len(units), "text": unit.content, **(unit.meta.get("reading_quote") or {})}
                 for index, unit in enumerate(units)
             ],
             "terminal": {"status": "completed", "retryable": False},
