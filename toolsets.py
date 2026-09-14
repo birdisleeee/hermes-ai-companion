@@ -582,10 +582,31 @@ TOOLSETS = {
         "includes": []
     },
 
+    "isles_reading": {
+        "description": "Bound source reader for one Flying Bird Islands reading discussion",
+        "tools": ["read_isles_reading_source"],
+        "includes": []
+    },
+
     "hermes-isles-story": {
         "description": "Flying Bird Islands trusted private chat toolset - full personal agent access",
         "tools": _HERMES_CORE_TOOLS + ["search_isles_stickers", "compose_isles_reply"],
         "includes": []
+    },
+
+    "hermes-isles-reading": {
+        "description": "Flying Bird Islands private reading discussion toolset - bound source reading only",
+        "tools": [],
+        "includes": ["isles_reading"]
+    },
+
+    # Unknown platform keys are expanded as ``hermes-{platform}`` by the
+    # shared tool resolver.  Keep the underscore alias so ``isles_reading``
+    # receives the same deliberately narrow toolset without config changes.
+    "hermes-isles_reading": {
+        "description": "Flying Bird Islands private reading discussion toolset alias",
+        "tools": [],
+        "includes": ["isles_reading"]
     },
 
     "hermes-gateway": {

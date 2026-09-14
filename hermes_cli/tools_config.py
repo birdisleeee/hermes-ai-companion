@@ -119,6 +119,7 @@ CONFIGURABLE_TOOLSETS = [
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
     ("computer_use",     "🖱️  Computer Use (macOS/Windows/Linux)", "background desktop control via cua-driver"),
     ("isles_stickers",   "🖼️  Flying Bird Islands Stickers", "trusted intent search and one-sticker reply planning"),
+    ("isles_reading",    "📖  Flying Bird Islands Reading", "bound source reading for one discussion"),
 ]
 
 
@@ -192,6 +193,7 @@ _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
     "discord": {"discord"},
     "discord_admin": {"discord"},
     "isles_stickers": {"isles_story"},
+    "isles_reading": {"isles_reading"},
 }
 
 

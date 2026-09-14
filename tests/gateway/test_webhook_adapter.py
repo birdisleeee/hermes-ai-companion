@@ -1510,6 +1510,87 @@ class TestSessionIsolation:
 class TestDeliveryCleanup:
 
     @pytest.mark.asyncio
+    async def test_reading_turn_identity_and_delivery_snapshot_are_not_overwritten(
+        self, tmp_path
+    ):
+        """Concurrent messages in one discussion keep their own callback IDs."""
+        secret = "reading-route-secret"
+        routes = {
+            "isles-reading": {
+                "secret": secret,
+                "deliver": "http_callback",
+                "deliver_extra": {
+                    "url": "https://isles-story.site/api/reading/gateway/reply"
+                },
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter._isles_turn_store = IslesTurnStore(tmp_path / "turns")
+        adapter.handle_message = AsyncMock()
+
+        def payload(turn_id, delivery_id, message_id):
+            return {
+                "protocol": "isles-reading-turn-v1",
+                "thread_id": "thread_one",
+                "turn_id": turn_id,
+                "delivery_id": delivery_id,
+                "book": {"title": "沿着海岸慢慢走", "author": "林屿舟"},
+                "discussion": {"topic": "为什么停下来？", "status": "open"},
+                "source": None,
+                "source_link": None,
+                "user_message": {"message_id": message_id, "text": "你怎么看？"},
+            }
+
+        async def post(cli, value, request_id):
+            raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+            timestamp = str(int(time.time()))
+            return await cli.post(
+                "/webhooks/isles-reading",
+                data=raw,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Request-ID": request_id,
+                    "X-Webhook-Timestamp": timestamp,
+                    "X-Webhook-Signature-V2": _generic_v2_signature(
+                        raw, secret, timestamp
+                    ),
+                },
+            )
+
+        first = payload("turn-one", "delivery-one", "message-one")
+        second = payload("turn-two", "delivery-two", "message-two")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            assert (await post(cli, first, "delivery-one")).status == 202
+            assert (await post(cli, second, "delivery-two")).status == 202
+            assert (await post(cli, second, "wrong-delivery")).status == 409
+
+        await asyncio.sleep(0.01)
+        events = [call.args[0] for call in adapter.handle_message.await_args_list]
+        assert [event.message_id for event in events] == ["turn-one", "turn-two"]
+        assert {event.source.chat_id for event in events} == {
+            "webhook:isles-reading:thread_one"
+        }
+        assert adapter._isles_turn_store.get("turn-one")["state"] == "accepted"
+        assert adapter._isles_turn_store.get("delivery-one") is None
+
+        # The second accepted turn has overwritten the session-level snapshot,
+        # but a reply to turn one must still use delivery-one.
+        adapter.mark_pending_reply_turn("turn-one", None)
+        adapter._emit_isles_turn_status = AsyncMock(return_value=True)
+        adapter._post_reading_signed = AsyncMock(return_value=True)
+        result = await adapter.send(
+            "webhook:isles-reading:thread_one",
+            "**先回应第一问。**",
+            reply_to="turn-one",
+        )
+        assert result.success is True
+        callback = adapter._post_reading_signed.await_args.args[2]
+        assert callback["turn_id"] == "turn-one"
+        assert callback["delivery_id"] == "delivery-one"
+        assert callback["actions"][0]["text"] == "**先回应第一问。**"
+
+    @pytest.mark.asyncio
     async def test_delivery_info_survives_multiple_sends(self):
         """send() must NOT pop delivery_info.
 

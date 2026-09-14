@@ -60,10 +60,15 @@ def validate_reading_turn(payload: Mapping[str, Any]) -> dict[str, Any]:
     if source is not None:
         if not isinstance(source, Mapping) or not isinstance(source.get("exact"), str) or len(source["exact"]) > 4_000:
             raise ValueError("invalid source")
-        if not isinstance(source_link, str) or not source_link.startswith("isles-reading://source/"):
+        if not source_link:
             raise ValueError("source link required")
-    elif source_link is not None:
-        raise ValueError("source link without source")
+    if source_link is not None:
+        source_pattern = re.compile(
+            rf"^isles-reading://source/{re.escape(thread_id)}/"
+            rf"[A-Za-z0-9_-]{{1,100}}\?version=[0-9]+&sha=[a-f0-9]{{64}}$"
+        )
+        if not isinstance(source_link, str) or not source_pattern.fullmatch(source_link):
+            raise ValueError("invalid source link")
     return {
         "protocol": _PROTOCOL,
         "thread_id": thread_id,
@@ -83,7 +88,7 @@ def build_reading_prompt(turn: Mapping[str, Any]) -> str:
 
     checked = validate_reading_turn(turn)
     lines = [
-        "你正在参加一个独立的共读讨论。请围绕当前议题自然回应，使用正常的 Markdown 排版。",
+        "这是你和一直与你聊天的本人围绕阅读内容的正常聊天，延续你们既有的身份、关系和称呼，自然回应即可。每个议题单独保存聊天记录。",
         "不要声称读过没有提供的章节或整本书；需要更多原文时，使用 source_link 通过已授权工具按范围读取。",
         f"书名：{checked['book']['title']}",
         f"作者：{checked['book']['author'] or '未知'}",
@@ -93,10 +98,12 @@ def build_reading_prompt(turn: Mapping[str, Any]) -> str:
     if source:
         lines.extend([f"已核验摘录：\n> {source['exact'].replace(chr(10), chr(10) + '> ')}", f"原文引用链接：{checked['source_link']}"])
         if source.get("insight"):
-            lines.append(f"岛主对摘录的想法：{source['insight']}")
+            lines.append(f"我对摘录的想法：{source['insight']}")
     else:
         lines.append("这是围绕整本书的议题，没有附带摘录。")
-    lines.append(f"岛主本轮发言：\n{checked['user_message']['text']}")
+        if checked.get("source_link"):
+            lines.append(f"需要核对书中内容时使用这个冻结原文引用链接按范围读取：{checked['source_link']}")
+    lines.append(f"我说：\n{checked['user_message']['text']}")
     return "\n\n".join(lines)
 
 

@@ -2519,9 +2519,8 @@ def _toolset_platform_config_key_for_source(source: Any) -> str:
 
     Generic webhooks intentionally receive a minimal tool surface because their
     payloads may contain untrusted third-party text. ``isles-story`` is a
-    separately authenticated private chat route, so it uses its own full-access
-    platform toolset without elevating comment, heartbeat, or future webhook
-    routes.
+    separately authenticated private chat route. ``isles-reading`` has a much
+    smaller tool surface that can only read the source link bound to its turn.
     """
     if getattr(source, "platform", None) == Platform.WEBHOOK:
         if (
@@ -2529,6 +2528,11 @@ def _toolset_platform_config_key_for_source(source: Any) -> str:
             or getattr(source, "user_id", "") == "webhook:isles-story"
         ):
             return "isles_story"
+        if (
+            getattr(source, "route", "") == "isles-reading"
+            or getattr(source, "user_id", "") == "webhook:isles-reading"
+        ):
+            return "isles_reading"
     return _platform_config_key(source.platform)
 
 
@@ -5886,7 +5890,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source_chat_name = str(getattr(event.source, "chat_name", "") or "")
         is_isles_story_turn = (
             str(source_platform or "").lower() == "webhook"
-            and source_chat_name == "webhook/isles-story"
+            and source_chat_name in {"webhook/isles-story", "webhook/isles-reading"}
         )
         if (
             event.message_type == MessageType.TEXT
@@ -13543,6 +13547,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.source.platform == Platform.WEBHOOK
                 and self.is_isles_story_source(event.source)
             )
+            _isles_reading = (
+                event.source.platform == Platform.WEBHOOK
+                and self.is_isles_reading_source(event.source)
+            )
             if _isles and _isles_reply_plan and not response:
                 response = next(
                     (
@@ -13568,6 +13576,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _context_window,
                         reply_plan=_isles_reply_plan,
                     )
+            if _isles_reading and response and not _already_sent:
+                webhook = self.adapters.get(event.source.platform)
+                if webhook and hasattr(webhook, "mark_pending_reply_turn"):
+                    webhook.mark_pending_reply_turn(event.message_id, None)
 
             # ── v4.2.19-phase2b: voice intent boundary ──
             _has_existing_audio = "MEDIA:" in (response or "")
@@ -14684,6 +14696,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         return False
 
+    @staticmethod
+    def is_isles_reading_source(source) -> bool:
+        """Detect an authenticated per-discussion reading-island turn."""
+        if getattr(source, 'route', '') == 'isles-reading':
+            return True
+        if getattr(source, 'user_name', '') == 'isles-reading':
+            return True
+        if getattr(source, 'user_id', '') == 'webhook:isles-reading':
+            return True
+        return False
+
     async def _emit_isles_processing_status(
         self,
         event: MessageEvent,
@@ -14692,7 +14715,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_is_new: bool,
     ) -> None:
         """Tell Isles which resolved Hermes information window owns a turn."""
-        if not self.is_isles_story_source(event.source) or not event.message_id:
+        is_story = self.is_isles_story_source(event.source)
+        is_reading = self.is_isles_reading_source(event.source)
+        if not (is_story or is_reading) or not event.message_id:
             return
         webhook = self.adapters.get(event.source.platform)
         if not webhook or not hasattr(webhook, "update_isles_turn_status"):
@@ -14700,8 +14725,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await webhook.update_isles_turn_status(
             event.message_id,
             "processing",
-            session_id=session_entry.session_id,
+            session_id=event.source.chat_id if is_reading else session_entry.session_id,
             session_is_new=session_is_new,
+            route_name="isles-reading" if is_reading else "isles-story",
         )
 
     @staticmethod
@@ -19309,10 +19335,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         _status_adapter = self._adapter_for_source(source)
         _isles_sticker_scope_kwargs = None
+        _isles_reading_scope_kwargs = None
         if _is_isles_story_webhook and event_message_id and _status_adapter is not None:
             try:
+                _delivery_info = getattr(_status_adapter, "_delivery_info", {})
                 _sticker_delivery = (
-                    getattr(_status_adapter, "_delivery_info", {}).get(source.chat_id)
+                    _delivery_info.get(f"turn:{event_message_id}")
+                    or _delivery_info.get(source.chat_id)
                     or _status_adapter._static_isles_delivery()
                 )
                 _sticker_extra = _sticker_delivery.get("deliver_extra", {})
@@ -19328,6 +19357,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }
             except Exception:
                 logger.debug("Could not bind Isles sticker tool scope", exc_info=True)
+        _is_isles_reading_webhook = (
+            source.platform == Platform.WEBHOOK
+            and self.is_isles_reading_source(source)
+        )
+        if _is_isles_reading_webhook and event_message_id and _status_adapter is not None:
+            try:
+                _delivery_info = getattr(_status_adapter, "_delivery_info", {})
+                _reading_delivery = (
+                    _delivery_info.get(f"turn:{event_message_id}")
+                    or _delivery_info.get(source.chat_id)
+                    or {}
+                )
+                _reading_extra = _reading_delivery.get("deliver_extra", {})
+                _reading_callback_url = str(_reading_extra.get("url") or "")
+                _reading_secret = str(_reading_delivery.get("callback_secret") or "")
+                _reading_payload = _reading_delivery.get("payload") if isinstance(_reading_delivery.get("payload"), dict) else {}
+                if _reading_callback_url.endswith("/api/reading/gateway/reply") and _reading_secret:
+                    _isles_reading_scope_kwargs = {
+                        "turn_id": str(event_message_id),
+                        "source_link": str(_reading_payload.get("source_link") or ""),
+                        "source_url": _reading_callback_url.rsplit("/reply", 1)[0] + "/source",
+                        "token": _reading_secret,
+                    }
+            except Exception:
+                logger.debug("Could not bind Isles reading tool scope", exc_info=True)
         tool_progress_enabled = (
             progress_mode not in {"off", "log"}
             and (source.platform != Platform.WEBHOOK or _is_isles_story_webhook)
@@ -21228,6 +21282,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _reply_plan = get_isles_reply_plan(_sticker_state)
                     if _reply_plan:
                         result["isles_reply_plan"] = _reply_plan
+                elif _isles_reading_scope_kwargs:
+                    from tools.isles_reading_tool import isles_reading_turn_scope
+                    with isles_reading_turn_scope(**_isles_reading_scope_kwargs):
+                        result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
                 else:
                     result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:

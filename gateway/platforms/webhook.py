@@ -56,6 +56,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.isles_reading import build_reading_prompt, validate_reading_turn
 from gateway.isles_turn_store import IslesTurnStore
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -344,6 +345,7 @@ class WebhookAdapter(BasePlatformAdapter):
         detail_code: str | None = None,
         session_id: str | None = None,
         session_is_new: bool | None = None,
+        route_name: str = "isles-story",
     ) -> None:
         """Persist and forward a real Agent lifecycle event to the Worker."""
         if not isinstance(turn_id, str) or not turn_id:
@@ -356,14 +358,18 @@ class WebhookAdapter(BasePlatformAdapter):
             detail_code=detail_code,
             process_token=self._process_token,
         )
-        await self._emit_isles_turn_status(
-            turn_id,
-            status,
-            retryable=retryable,
-            detail_code=detail_code,
-            session_id=session_id,
-            session_is_new=session_is_new,
-        )
+        status_kwargs = {
+            "retryable": retryable,
+            "detail_code": detail_code,
+            "session_id": session_id,
+            "session_is_new": session_is_new,
+        }
+        if route_name == "isles-story":
+            await self._emit_isles_turn_status(turn_id, status, **status_kwargs)
+        else:
+            await self._emit_isles_turn_status(
+                turn_id, status, route_name=route_name, **status_kwargs
+            )
 
     def _static_isles_delivery(self, route_name: str = "isles-story") -> dict:
         return self._delivery_config_for_route(route_name, {})
@@ -371,11 +377,16 @@ class WebhookAdapter(BasePlatformAdapter):
     def _delivery_config_for_route(self, route_name: str, payload: dict) -> dict:
         route = self._routes.get(route_name, {})
         return {
+            "route": route_name,
             "deliver": route.get("deliver", "log"),
             "deliver_extra": self._render_delivery_extra(
                 route.get("deliver_extra", {}), payload
             ),
             "reply_delivery": ReplyDeliveryConfig.from_route(route),
+            "callback_secret": str(
+                route.get("secret", getattr(self, "_global_secret", "")) or ""
+            ),
+            "payload": dict(payload) if route_name == "isles-reading" else None,
         }
 
     async def _emit_isles_turn_status(
@@ -396,6 +407,28 @@ class WebhookAdapter(BasePlatformAdapter):
         extra = delivery.get("deliver_extra", {})
         callback_url = str(extra.get("url") or "")
         token = str(extra.get("token") or "")
+        callback_secret = str(delivery.get("callback_secret") or "")
+        if route_name == "isles-reading":
+            status_url = str(extra.get("status_url") or "")
+            if not status_url and callback_url.endswith("/api/reading/gateway/reply"):
+                status_url = callback_url.rsplit("/reply", 1)[0] + "/status"
+            if not status_url or not callback_secret:
+                return False
+            payload = {
+                "protocol": "isles-reading-status-v1",
+                "turn_id": turn_id,
+                "status": status,
+                "retryable": bool(retryable),
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            }
+            if detail_code:
+                payload["detail_code"] = detail_code
+            normalized_session_id = session_id.strip() if isinstance(session_id, str) else ""
+            if normalized_session_id:
+                payload["session_id"] = normalized_session_id
+            if session_is_new is not None:
+                payload["session_is_new"] = bool(session_is_new)
+            return await self._post_reading_signed(status_url, callback_secret, payload)
         if not callback_url or not token:
             return False
         if "/api/chat/callback" in callback_url:
@@ -489,7 +522,9 @@ class WebhookAdapter(BasePlatformAdapter):
             process_token=self._process_token,
         )
         await self._emit_isles_turn_status(turn_id, "delivering", route_name=route_name)
-        if len(units) > 1 or any(unit.type == "sticker" for unit in units):
+        if route_name == "isles-reading":
+            result = await self._deliver_reading_callback(units, delivery, turn_id)
+        elif len(units) > 1 or any(unit.type == "sticker" for unit in units):
             result = await self._deliver_grouped_http_callbacks(units, delivery, turn_id, config)
         else:
             result = await self._deliver_http_callback(
@@ -515,8 +550,61 @@ class WebhookAdapter(BasePlatformAdapter):
             retryable=False,
             process_token=self._process_token,
         )
-        await self._emit_isles_turn_status(turn_id, "completed", route_name=route_name)
+        # The reading reply envelope commits all visible Markdown actions and
+        # the completed terminal state atomically in the Worker.  A second
+        # completed status callback would be redundant and can race that commit.
+        if route_name != "isles-reading":
+            await self._emit_isles_turn_status(turn_id, "completed")
         return True
+
+    async def _post_reading_signed(self, url: str, secret: str, payload: dict) -> bool:
+        import aiohttp
+
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        timestamp = str(int(time.time()))
+        signature = hmac.new(secret.encode(), f"{timestamp}.{raw}".encode(), hashlib.sha256).hexdigest()
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    url,
+                    data=raw.encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json; charset=utf-8",
+                        "X-Webhook-Timestamp": timestamp,
+                        "X-Webhook-Signature-V2": signature,
+                        "User-Agent": "hermes-isles-reading/1.0",
+                    },
+                ) as response:
+                    return 200 <= response.status < 300
+        except Exception:
+            return False
+
+    async def _deliver_reading_callback(
+        self, units: List[ReplyUnit], delivery: dict, turn_id: str
+    ) -> "SendResult":
+        extra = delivery.get("deliver_extra", {})
+        url = str(extra.get("url") or "")
+        secret = str(delivery.get("callback_secret") or "")
+        original = delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {}
+        meta = dict(units[0].meta) if units else {}
+        thread_id = str(original.get("thread_id") or meta.get("reading_thread_id") or "")
+        delivery_id = str(original.get("delivery_id") or meta.get("reading_delivery_id") or "")
+        if not url.endswith("/api/reading/gateway/reply") or not secret or not thread_id or not delivery_id or not units:
+            return SendResult(success=False, error="Invalid reading callback configuration")
+        payload = {
+            "protocol": "isles-reading-reply-v1",
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "delivery_id": delivery_id,
+            "actions": [
+                {"kind": "text", "index": index, "count": len(units), "text": unit.content}
+                for index, unit in enumerate(units)
+            ],
+            "terminal": {"status": "completed", "retryable": False},
+        }
+        delivered = await self._post_reading_signed(url, secret, payload)
+        return SendResult(success=delivered, error=None if delivered else "Reading callback failed")
 
     async def _deliver_grouped_http_callbacks(
         self,
@@ -902,7 +990,15 @@ class WebhookAdapter(BasePlatformAdapter):
         do not consume the entry and silently downgrade the final response
         to the ``log`` deliver type.  TTL cleanup happens on POST.
         """
-        delivery = self._delivery_info.get(chat_id, {})
+        # A conversational route reuses one session chat_id, so a later turn
+        # can arrive before an earlier response finishes.  Prefer the immutable
+        # per-turn snapshot to avoid binding the earlier reply to the later
+        # callback identity.
+        delivery = (
+            self._delivery_info.get(f"turn:{reply_to}", {})
+            if isinstance(reply_to, str) and reply_to
+            else {}
+        ) or self._delivery_info.get(chat_id, {})
         if chat_id == "webhook:isles-story:main" and not delivery:
             delivery = self._static_isles_delivery()
         deliver_type = delivery.get("deliver", "log")
@@ -920,6 +1016,46 @@ class WebhookAdapter(BasePlatformAdapter):
                 if isinstance(reply_to, str) and reply_to
                 else None
             )
+            _route_name = str(delivery.get("route") or "")
+            if _route_name == "isles-reading":
+                if _turn_marker is None or not isinstance(reply_to, str) or not reply_to:
+                    return SendResult(success=False, error="Reading turn is not bound")
+                _reply_config = delivery.get("reply_delivery")
+                if not isinstance(_reply_config, ReplyDeliveryConfig):
+                    _reply_config = ReplyDeliveryConfig()
+                _units = build_reply_units(
+                    content,
+                    turn_id=reply_to,
+                    config=_reply_config,
+                    origin="user_turn",
+                )
+                original = delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {}
+                for unit in _units:
+                    unit.meta["reading_thread_id"] = str(original.get("thread_id") or "")
+                    unit.meta["reading_delivery_id"] = str(original.get("delivery_id") or "")
+                self._isles_turn_store.transition(
+                    reply_to,
+                    "delivering",
+                    retryable=True,
+                    process_token=self._process_token,
+                    outbox=[{
+                        "content": unit.content,
+                        "meta": dict(unit.meta),
+                        "type": unit.type,
+                        "sticker": {},
+                        "fallback_text": "",
+                    } for unit in _units],
+                )
+                await self._emit_isles_turn_status(reply_to, "delivering", route_name="isles-reading")
+                _result = await self._deliver_reading_callback(_units, delivery, reply_to)
+                if _result.success:
+                    self._pending_reply_turns.pop(reply_to, None)
+                    self._isles_turn_store.transition(reply_to, "completed", retryable=False, process_token=self._process_token)
+                else:
+                    self._isles_turn_store.transition(reply_to, "delivery_failed", retryable=True, detail_code="callback_failed", process_token=self._process_token)
+                    await self._emit_isles_turn_status(reply_to, "failed", retryable=True, detail_code="callback_failed", route_name="isles-reading")
+                    self._schedule_isles_outbox_retry(reply_to)
+                return _result
             if chat_id == "webhook:isles-story:main" and _turn_marker is None:
                 event_metadata = metadata if isinstance(metadata, dict) else {}
                 event_id = str(event_metadata.get("_isles_system_event_id") or "")
@@ -1456,11 +1592,20 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
             payload = transformed_payload or payload
 
-        # Format prompt from template
-        prompt_template = route_config.get("prompt", "")
-        prompt = self._render_prompt(
-            prompt_template, payload, event_type, route_name
-        )
+        # The private reading route validates its complete envelope and builds
+        # a fixed prompt. Generic templates must not reinterpret book text or
+        # allow the sender to replace the source-reading instructions.
+        if route_name == "isles-reading":
+            try:
+                payload = validate_reading_turn(payload)
+                prompt = build_reading_prompt(payload)
+            except ValueError:
+                return web.json_response({"error": "Invalid reading turn"}, status=400)
+        else:
+            prompt_template = route_config.get("prompt", "")
+            prompt = self._render_prompt(
+                prompt_template, payload, event_type, route_name
+            )
 
         # Inject skill content if configured.
         # We call build_skill_invocation_message() directly rather than
@@ -1499,6 +1644,16 @@ class WebhookAdapter(BasePlatformAdapter):
                 request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
             ),
         )
+        if route_name == "isles-reading" and payload.get("delivery_id") != delivery_id:
+            return web.json_response(
+                {"status": "conflict", "error": "Reading delivery identity mismatch"},
+                status=409,
+            )
+        durable_turn_id = (
+            str(payload["turn_id"])
+            if route_name == "isles-reading"
+            else delivery_id
+        )
 
         # ── Idempotency ─────────────────────────────────────────
         # Generic routes keep the in-memory TTL. Isles story additionally
@@ -1506,10 +1661,10 @@ class WebhookAdapter(BasePlatformAdapter):
         # accepted user message into an unsafe second Agent run.
         now = time.time()
         is_durable_isles = (
-            route_name == "isles-story"
+            route_name in {"isles-story", "isles-reading"}
             and route_config.get("deliver") == "http_callback"
         )
-        durable_record = self._isles_turn_store.get(delivery_id) if is_durable_isles else None
+        durable_record = self._isles_turn_store.get(durable_turn_id) if is_durable_isles else None
         payload_sha256 = self._isles_turn_store.payload_fingerprint(raw_body)
         if durable_record and durable_record.get("payload_sha256") != payload_sha256:
             return web.json_response(
@@ -1522,7 +1677,7 @@ class WebhookAdapter(BasePlatformAdapter):
             and durable_record.get("state") in {"interrupted", "processing_failed"}
         )
         if durable_record and durable_record.get("state") == "delivery_failed" and durable_record.get("outbox"):
-            self._schedule_isles_outbox_retry(delivery_id)
+            self._schedule_isles_outbox_retry(durable_turn_id)
             return web.json_response(
                 {
                     "status": "accepted",
@@ -1564,14 +1719,14 @@ class WebhookAdapter(BasePlatformAdapter):
         if is_durable_isles:
             if durable_record:
                 self._isles_turn_store.transition(
-                    delivery_id,
+                    durable_turn_id,
                     "accepted",
                     retryable=False,
                     process_token=self._process_token,
                 )
             else:
                 self._isles_turn_store.receive(
-                    delivery_id,
+                    durable_turn_id,
                     payload_sha256=payload_sha256,
                     route=route_name,
                     process_token=self._process_token,
@@ -1639,7 +1794,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # keep one stable session per route so chat context survives ordinary
         # messages. Non-conversational webhooks retain the official per-delivery
         # isolation used for CI/events and other one-shot work.
-        if route_config.get("deliver") == "http_callback":
+        if route_name == "isles-reading":
+            session_chat_id = str(payload["session_id"])
+        elif route_config.get("deliver") == "http_callback":
             session_chat_id = f"webhook:{route_name}:main"
         else:
             session_chat_id = f"webhook:{route_name}:{delivery_id}"
@@ -1653,6 +1810,11 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
+        if is_durable_isles:
+            turn_delivery_key = f"turn:{durable_turn_id}"
+            self._delivery_info[turn_delivery_key] = deliver_config
+            self._delivery_info_created[turn_delivery_key] = now
+            self._delivery_info_order.append((now, turn_delivery_key))
         self._prune_delivery_info(now)
 
         # Build source and event
@@ -1673,7 +1835,7 @@ class WebhookAdapter(BasePlatformAdapter):
             except ValueError as exc:
                 if is_durable_isles:
                     self._isles_turn_store.transition(
-                        delivery_id,
+                        durable_turn_id,
                         "processing_failed",
                         retryable=True,
                         detail_code="invalid_media",
@@ -1689,7 +1851,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
                 if is_durable_isles:
                     self._isles_turn_store.transition(
-                        delivery_id,
+                        durable_turn_id,
                         "processing_failed",
                         retryable=True,
                         detail_code="media_download_failed",
@@ -1705,7 +1867,7 @@ class WebhookAdapter(BasePlatformAdapter):
             message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
             source=source,
             raw_message=payload,
-            message_id=delivery_id,
+            message_id=durable_turn_id,
             media_urls=media_urls,
             media_types=media_types,
         )
@@ -1769,17 +1931,30 @@ class WebhookAdapter(BasePlatformAdapter):
         chat_name = str(getattr(event.source, "chat_name", "") or "")
         route_name = chat_name.removeprefix("webhook/")
         route_config = self._routes.get(route_name, {})
-        if route_config.get("deliver") == "http_callback" and route_name == "isles-story":
+        if route_config.get("deliver") == "http_callback" and route_name in {"isles-story", "isles-reading"}:
             turn_id = str(getattr(event, "message_id", "") or "")
             if not turn_id:
                 return
             record = self._isles_turn_store.get(turn_id) or {}
             state = str(record.get("state") or "")
+            if route_name == "isles-reading" and state in {"delivering", "delivery_failed"}:
+                # The durable outbox owns this reply now, including retries.
+                # Agent completion must not replace it with an empty-reply failure.
+                return
             if outcome == ProcessingOutcome.SUCCESS and state != "completed":
                 # Intentional-silence turns have no visible callback, but they
                 # are still terminal. Do not leave the Worker/UI in processing.
                 self._pending_reply_turns.pop(turn_id, None)
-                await self.update_isles_turn_status(turn_id, "completed")
+                if route_name == "isles-reading":
+                    await self.update_isles_turn_status(
+                        turn_id,
+                        "failed",
+                        retryable=True,
+                        detail_code="empty_reply",
+                        route_name=route_name,
+                    )
+                else:
+                    await self.update_isles_turn_status(turn_id, "completed")
             elif outcome == ProcessingOutcome.CANCELLED and state != "completed":
                 self._pending_reply_turns.pop(turn_id, None)
                 await self.update_isles_turn_status(
@@ -1787,6 +1962,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     "interrupted",
                     retryable=True,
                     detail_code="processing_cancelled",
+                    route_name=route_name,
                 )
             elif outcome == ProcessingOutcome.FAILURE and state not in {
                 "completed", "delivery_failed", "processing_failed"
@@ -1797,6 +1973,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     "failed",
                     retryable=True,
                     detail_code="processing_failed",
+                    route_name=route_name,
                 )
             return
         if route_config.get("deliver") != "http_callback":
