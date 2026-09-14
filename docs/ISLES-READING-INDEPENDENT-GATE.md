@@ -60,6 +60,8 @@ platforms:
 
 ## 报告及限制
 
+后续候选新增验证：HTTP 接收端先返回 503，新建没有内存 delivery snapshot 的适配器，实际调用 connect() 自动恢复磁盘 outbox，再次回调正文及身份与第一次逐字相同；未完成推理标为 interrupted/retryable，isles-story 测试记录保持原样。此测试是同进程重新构造适配器，不是杀死并重启独立 OS 进程，不能据此宣称跨进程崩溃恢复已验收。须针对新候选重新运行服务器闸门。
+
 报告候选身份、导入位置、定向/回归完整统计、HTTP 三回合两议题乱序回调结果、临时 HOME 路径和生产前后指纹。只回报脱敏信息。
 当前测试中的模型/Worker 接收端是替身；它不证明浏览器→CF候选→Hermes→CF 的完整联合链路，也不证明真实人格加载、模型回应或 iPhone 验收。Gateway 重启恢复、FIFO 超限、回调失败重试与跨进程联合闸门仍需进一步验证；通过本轮也不得声明可直接上线。
 不得 restart、改 unit、生产 config、Secret、Tunnel、Worker、R2、session 或沈初服务。闸门完成后停在报告阶段。

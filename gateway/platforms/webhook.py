@@ -474,6 +474,21 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return False
 
+    async def _recover_reading_turns(self) -> None:
+        if self._routes.get("isles-reading", {}).get("deliver") != "http_callback":
+            return
+        for record in self._isles_turn_store.records():
+            if record.get("route") != "isles-reading" or record.get("process_token") == self._process_token:
+                continue
+            state = record.get("state")
+            if state in {"delivering", "delivery_failed"} and record.get("outbox"):
+                self._isles_turn_store.transition(record["turn_id"], "delivery_failed", retryable=True,
+                    detail_code="gateway_restarted", process_token=self._process_token)
+                self._schedule_isles_outbox_retry(record["turn_id"])
+            elif state in {"accepted", "processing", "compacting", "reply_ready"}:
+                await self.update_isles_turn_status(record["turn_id"], "interrupted", retryable=True,
+                    detail_code="gateway_restarted", route_name="isles-reading")
+
     def _schedule_isles_outbox_retry(self, turn_id: str) -> None:
         existing = self._isles_retry_tasks.get(turn_id)
         if existing and not existing.done():
@@ -957,6 +972,7 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return False
         self._mark_connected()
+        await self._recover_reading_turns()
 
         route_names = ", ".join(self._routes.keys()) or "(none configured)"
         logger.info(

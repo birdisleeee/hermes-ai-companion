@@ -15,7 +15,8 @@ from tests.gateway.test_isles_reading_contract import turn
 
 
 @pytest.mark.asyncio
-async def test_signed_reading_http_keeps_three_turns_and_two_discussions(tmp_path):
+@pytest.mark.parametrize("fail_first_reply", [False, True])
+async def test_signed_reading_http_keeps_three_turns_and_two_discussions(tmp_path, fail_first_reply):
     secret = "isolated-reading-network-fixture"
     received, events = [], []
 
@@ -26,6 +27,8 @@ async def test_signed_reading_http_keeps_three_turns_and_two_discussions(tmp_pat
         assert hmac.compare_digest(request.headers.get("X-Webhook-Signature-V2", ""), expected)
         assert abs(time.time() - int(timestamp)) < 300
         received.append((request.path, json.loads(raw)))
+        if fail_first_reply and request.path.endswith('/reply') and sum(path.endswith('/reply') for path, _ in received) == 1:
+            return web.json_response({"error": "temporary fixture failure"}, status=503)
         return web.json_response({"ok": True})
 
     receiver = web.Application()
@@ -68,10 +71,36 @@ async def test_signed_reading_http_keeps_three_turns_and_two_discussions(tmp_pat
                 event = events[index]
                 adapter.mark_pending_reply_turn(event.message_id, None)
                 result = await adapter.send(event.source.chat_id, f"**回复 {index + 1}**<BREAK>> 第二段", reply_to=event.message_id)
+                if fail_first_reply and index == 2:
+                    assert not result.success
+                    record = adapter._isles_turn_store.get(event.message_id)
+                    assert record["state"] == "delivery_failed"
+                    # Reconstruct an adapter from disk with no in-memory turn snapshot.
+                    recovered = _make_adapter(host="127.0.0.1", routes=adapter._routes)
+                    recovered._isles_turn_store = IslesTurnStore(tmp_path / "turns")
+                    assert not recovered._delivery_info
+                    recovered._isles_turn_store.receive("main_fixture", payload_sha256="a" * 64,
+                        route="isles-story", process_token="old-process")
+                    main_before = recovered._isles_turn_store.get("main_fixture")
+                    assert await recovered.connect()
+                    try:
+                        task = recovered._isles_retry_tasks.get(event.message_id)
+                        if task:
+                            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+                    finally:
+                        await recovered.disconnect()
+                    assert recovered._isles_turn_store.get(event.message_id)["state"] == "completed"
+                    assert recovered._isles_turn_store.get("main_fixture") == main_before
+                    assert recovered._isles_turn_store.get("turn_1")["state"] == "interrupted"
+                    assert recovered._isles_turn_store.get("turn_1")["retryable"] is True
+                    continue
                 assert result.success
                 assert adapter._isles_turn_store.get(event.message_id)["state"] == "completed"
 
     replies = [payload for path, payload in received if path.endswith("/reply")]
+    if fail_first_reply:
+        assert replies[0] == replies[1]
+        replies = replies[1:]
     assert len(replies) == 3
     for payload, n in zip(replies, [3, 1, 2]):
         assert payload["turn_id"] == f"turn_{n}"
