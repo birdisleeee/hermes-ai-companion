@@ -266,6 +266,31 @@ class TestBusySessionAck:
         adapter._send_with_retry.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_reading_fifo_overflow_reports_retryable_failure_without_losing_queued_turns(self):
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "queue"
+        runner._queued_events = {}
+        adapter = _make_adapter(platform_val="webhook")
+        adapter.update_isles_turn_status = AsyncMock()
+        source = SessionSource(platform=Platform.WEBHOOK, chat_id="webhook:isles-reading:thread_one",
+            chat_name="webhook/isles-reading", chat_type="private", user_id="webhook:isles-reading")
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        for n in range(33):
+            event = MessageEvent(text=f"第{n}句", message_type=MessageType.TEXT, source=source, message_id=f"reading_{n}")
+            assert await runner._handle_active_session_busy_message(event, sk)
+        assert runner._queue_depth(sk, adapter=adapter) == 32
+        queued = [adapter._pending_messages[sk], *runner._queued_events[sk]]
+        assert [event.message_id for event in queued] == [f"reading_{n}" for n in range(32)]
+        adapter.update_isles_turn_status.assert_awaited_once_with("reading_32", "failed", retryable=True,
+            detail_code="reading_queue_full", route_name="isles-reading")
+        agent.interrupt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_isles_busy_text_preserves_each_worker_turn_as_fifo(self):
         """Authenticated Isles deliveries must never merge distinct turn IDs."""
         runner, _sentinel = _make_runner()

@@ -5969,6 +5969,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
         if not steered:
+            if self.is_isles_reading_source(event.source) and self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+                await adapter.update_isles_turn_status(event.message_id, "failed", retryable=True,
+                    detail_code="reading_queue_full", route_name="isles-reading")
+                return True
             self._queue_or_replace_pending_event(session_key, event)
 
         if is_isles_story_turn:

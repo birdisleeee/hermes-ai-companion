@@ -17,6 +17,7 @@ export HERMES_HOME="$(mktemp -d /tmp/isles-reading-gate-XXXXXXXX)"
 export PYTHONDONTWRITEBYTECODE=1
 PYTHON -c 'import gateway; print(gateway.__file__)'
 PYTHON -m pytest -q -p no:cacheprovider tests/gateway/test_isles_reading_contract.py tests/gateway/test_isles_reading_network.py
+PYTHON -m pytest -q -p no:cacheprovider tests/gateway/test_isles_reading_process.py tests/gateway/test_busy_session_ack.py
 PYTHON -m pytest -q -p no:cacheprovider tests/gateway/test_webhook_adapter.py tests/gateway/test_isles_sticker_reply.py tests/gateway/test_isles_story_tool_permissions.py tests/gateway/test_isles_context_window_session.py tests/gateway/test_isles_media_and_segmentation.py
 ```
 
@@ -59,6 +60,10 @@ platforms:
 - send(reply_to=turn_id) 从 turn 快照取 delivery，回复按现有分段器生成一次带全部 Markdown actions 的回调。Worker 承担原子消息落库。
 
 ## 报告及限制
+
+最新恢复候选追加：`test_isles_reading_process.py` 启动独立 Python 子进程，使用实际 WebhookAdapter HTTP 入口和磁盘 outbox；临时接收端返回 503 后，父进程 kill 子进程，再以相同临时数据目录启动另一 PID，实际 connect() 自动重发。断言全部回调 payload 相同，两个 Markdown 段及 thread/turn/delivery 标识完整。该测试使用替身模型输出和替身 Worker 接收端，尚不覆盖真正 CF Worker 数据落库和浏览器。`reading_process_fixture.py` 是仅供此测试启动的 loopback 夹具，不是生产服务入口。所有子进程均在 finally 终止，临时 HOME 不读取生产文件。
+
+FIFO 新增测试真实经过 busy-message 处理路径，32 条等待事件逐条保留，第 33 条以 `reading_queue_full` 回报 failed/retryable，不发送无绑定气泡、不打断当前 Agent。本次只覆盖普通共读忙碌队列；服务器应复跑全部 busy-session 回归。真实 CF 联合联调、状态通知断网后的补偿、服务优雅关闭中的队列行为仍需后续验证。
 
 后续候选新增验证：HTTP 接收端先返回 503，新建没有内存 delivery snapshot 的适配器，实际调用 connect() 自动恢复磁盘 outbox，再次回调正文及身份与第一次逐字相同；未完成推理标为 interrupted/retryable，isles-story 测试记录保持原样。此测试是同进程重新构造适配器，不是杀死并重启独立 OS 进程，不能据此宣称跨进程崩溃恢复已验收。须针对新候选重新运行服务器闸门。
 
